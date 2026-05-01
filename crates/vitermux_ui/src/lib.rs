@@ -9,9 +9,11 @@ use gpui::{
 };
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use parking_lot::Mutex;
+use project::ProjectPath;
 use remote::{RemoteConnectionOptions, SshConnectionOptions, same_remote_connection_identity};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use task::{
     HideStrategy, RevealStrategy, RevealTarget, SaveStrategy, Shell, SpawnInTerminal, TaskId,
 };
@@ -31,6 +33,8 @@ use workspace::{
 };
 
 const VITERMUX_PANEL_KEY: &str = "VitermuxPanel";
+const PROJECT_REPOSITORY_DISCOVERY_ATTEMPTS: usize = 60;
+const PROJECT_REPOSITORY_DISCOVERY_DELAY: Duration = Duration::from_millis(50);
 
 actions!(
     vitermux_panel,
@@ -397,17 +401,54 @@ impl VitermuxPanel {
                 }
 
                 let plan = client.fetch_open_plan(&session_key).await?;
-                let workspace = ensure_project_workspace_for_plan(
+                let resolved_workspace = match resolve_project_workspace_for_plan(
                     workspace.clone(),
                     requesting_window.clone(),
                     &plan,
                     cx,
                 )
                 .await
-                .unwrap_or(workspace);
-                let workspace_is_remote =
-                    workspace.read_with(cx, |workspace, cx| workspace.project().read(cx).is_remote());
-                let spawn_task = build_spawn_task(&row, &plan, workspace_is_remote)?;
+                {
+                    Ok(resolution) => resolution,
+                    Err(error) => {
+                        let source_workspace_is_remote = workspace
+                            .read_with(cx, |workspace, cx| {
+                                workspace.project().read(cx).is_remote()
+                            });
+                        if !allow_source_workspace_attach_fallback(source_workspace_is_remote) {
+                            return Err(error.context(
+                                "cannot safely fall back to attach from a remote source workspace",
+                            ));
+                        }
+                        ProjectWorkspaceResolution {
+                            workspace: workspace.clone(),
+                            matched_project_context: false,
+                        }
+                    }
+                };
+                let workspace = resolved_workspace.workspace;
+                if resolved_workspace.matched_project_context {
+                    let _ = sync_workspace_project_context_for_plan(
+                        workspace.clone(),
+                        &plan,
+                        ProjectContextSyncMode::BestEffort,
+                        cx,
+                    )
+                    .await;
+                }
+                let workspace_is_remote = workspace
+                    .read_with(cx, |workspace, cx| workspace.project().read(cx).is_remote());
+                let spawn_inside_target_remote_workspace = attach_inside_target_remote_workspace(
+                    &plan,
+                    resolved_workspace.matched_project_context,
+                    workspace_is_remote,
+                );
+                let spawn_task = build_spawn_task(
+                    &row,
+                    &plan,
+                    spawn_inside_target_remote_workspace,
+                    workspace_is_remote,
+                )?;
                 let terminal_panel =
                     workspace.read_with(cx, |workspace, cx| workspace.panel::<TerminalPanel>(cx));
                 let did_focus_existing = workspace.update_in(cx, |workspace, window, cx| {
@@ -461,16 +502,32 @@ impl VitermuxPanel {
             let workspace = workspace?;
             let session_key = session_key?;
             let plan = client.fetch_open_plan(&session_key).await?;
+            if let Some(failure) = plan.failure.as_ref() {
+                return Err(open_plan_failure(failure));
+            }
             if project_target_path(&plan).is_none() {
                 return Err(anyhow!(
                     "daemon open plan did not include a project path for review"
                 ));
             }
 
-            let workspace =
-                ensure_project_workspace_for_plan(workspace, requesting_window, &plan, cx).await?;
+            let resolved_workspace =
+                resolve_project_workspace_for_plan(workspace, requesting_window, &plan, cx).await?;
+            let workspace = resolved_workspace.workspace;
+            let Some(project_path) = sync_workspace_project_context_for_plan(
+                workspace.clone(),
+                &plan,
+                ProjectContextSyncMode::RequireGitRepository,
+                cx,
+            )
+            .await?
+            else {
+                return Err(anyhow!(
+                    "daemon open plan did not resolve a project path for review"
+                ));
+            };
             workspace.update_in(cx, |workspace, window, cx| {
-                ProjectDiff::deploy_at(workspace, None, window, cx);
+                ProjectDiff::deploy_at_project_path(workspace, project_path, window, cx);
             })?;
             Ok(())
         })
@@ -624,16 +681,18 @@ impl VitermuxPanel {
                                         format!("review:{}", row_key.as_ref()),
                                         IconName::Diff,
                                     )
-                                        .icon_size(IconSize::Small)
-                                        .icon_color(Color::Muted)
-                                        .tooltip(Tooltip::text("Open review diff"))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Open review diff"))
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
                                             this.open_review_for_row(
                                                 review_row.clone(),
                                                 window,
                                                 cx,
                                             );
-                                        })),
+                                        },
+                                    )),
                                 )
                             })
                             .child(Icon::new(IconName::ChevronRight).color(Color::Muted)),
@@ -905,6 +964,125 @@ async fn ensure_project_workspace_for_plan(
     open_task.await
 }
 
+struct ProjectWorkspaceResolution {
+    workspace: Entity<Workspace>,
+    matched_project_context: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ProjectContextSyncMode {
+    BestEffort,
+    RequireGitRepository,
+}
+
+async fn resolve_project_workspace_for_plan(
+    source_workspace: Entity<Workspace>,
+    requesting_window: Option<WindowHandle<MultiWorkspace>>,
+    plan: &ZedOpenPlan,
+    cx: &mut AsyncWindowContext,
+) -> Result<ProjectWorkspaceResolution> {
+    let has_target_path = project_target_path(plan).is_some();
+    if !has_target_path {
+        return Ok(ProjectWorkspaceResolution {
+            workspace: source_workspace,
+            matched_project_context: false,
+        });
+    }
+
+    if requesting_window.is_none() {
+        return Err(anyhow!(
+            "cannot resolve target project workspace without a Zed operator window"
+        ));
+    }
+
+    let workspace =
+        ensure_project_workspace_for_plan(source_workspace, requesting_window, plan, cx).await?;
+    Ok(ProjectWorkspaceResolution {
+        workspace,
+        matched_project_context: true,
+    })
+}
+
+async fn sync_workspace_project_context_for_plan(
+    workspace: Entity<Workspace>,
+    plan: &ZedOpenPlan,
+    mode: ProjectContextSyncMode,
+    cx: &mut AsyncWindowContext,
+) -> Result<Option<ProjectPath>> {
+    let Some(target_path) = project_target_path(plan) else {
+        return Ok(None);
+    };
+
+    let project_path_task = workspace.update(cx, |workspace, cx| {
+        Workspace::project_path_for_path(workspace.project().clone(), &target_path, true, cx)
+    });
+    let (_, project_path) = project_path_task.await?;
+
+    match mode {
+        ProjectContextSyncMode::BestEffort => {
+            let _ = set_active_repository_for_project_path(workspace.clone(), &project_path, cx);
+        }
+        ProjectContextSyncMode::RequireGitRepository => {
+            wait_for_project_path_repository(workspace.clone(), &project_path, cx).await?;
+            set_active_repository_for_project_path(workspace.clone(), &project_path, cx)?;
+        }
+    }
+
+    Ok(Some(project_path))
+}
+
+async fn wait_for_project_path_repository(
+    workspace: Entity<Workspace>,
+    project_path: &ProjectPath,
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
+    for attempt in 0..=PROJECT_REPOSITORY_DISCOVERY_ATTEMPTS {
+        if project_path_repository_is_ready(workspace.clone(), project_path, cx)? {
+            return Ok(());
+        }
+
+        if attempt == PROJECT_REPOSITORY_DISCOVERY_ATTEMPTS {
+            break;
+        }
+
+        cx.background_executor()
+            .timer(PROJECT_REPOSITORY_DISCOVERY_DELAY)
+            .await;
+    }
+
+    Err(anyhow!(
+        "target project path did not resolve to a git repository"
+    ))
+}
+
+fn project_path_repository_is_ready(
+    workspace: Entity<Workspace>,
+    project_path: &ProjectPath,
+    cx: &mut AsyncWindowContext,
+) -> Result<bool> {
+    Ok(workspace.update(cx, |workspace, cx| {
+        let git_store = workspace.project().read(cx).git_store().clone();
+        git_store
+            .read(cx)
+            .repository_and_path_for_project_path(project_path, cx)
+            .is_some()
+    }))
+}
+
+fn set_active_repository_for_project_path(
+    workspace: Entity<Workspace>,
+    project_path: &ProjectPath,
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
+    workspace.update(cx, |workspace, cx| {
+        let git_store = workspace.project().read(cx).git_store().clone();
+        git_store.update(cx, |git_store, cx| {
+            git_store.set_active_repo_for_path(project_path, cx);
+        });
+    });
+    Ok(())
+}
+
 fn find_matching_workspace_in_window(
     multi_workspace: &MultiWorkspace,
     target_paths: &[PathBuf],
@@ -952,7 +1130,11 @@ fn find_matching_workspace_in_window(
 fn matching_root_depth(root_paths: &[Arc<Path>], target_paths: &[PathBuf]) -> usize {
     root_paths
         .iter()
-        .filter(|root| target_paths.iter().all(|path| path.starts_with(root.as_ref())))
+        .filter(|root| {
+            target_paths
+                .iter()
+                .all(|path| path.starts_with(root.as_ref()))
+        })
         .map(|root| root.components().count())
         .max()
         .unwrap_or(0)
@@ -978,13 +1160,14 @@ fn project_target_path(plan: &ZedOpenPlan) -> Option<PathBuf> {
 fn build_spawn_task(
     row: &WorkbenchRow,
     plan: &ZedOpenPlan,
+    attach_inside_target_remote_workspace: bool,
     workspace_is_remote: bool,
 ) -> Result<SpawnInTerminal> {
     if let Some(failure) = plan.failure.as_ref() {
         return Err(open_plan_failure(failure));
     }
 
-    let (command, args) = resolve_attach_command(plan, workspace_is_remote)?;
+    let (command, args) = resolve_attach_command(plan, attach_inside_target_remote_workspace)?;
     let (shell, command, args) = spawn_command_parts(plan, command, args);
     let cwd = spawn_cwd(plan, workspace_is_remote);
     let dedupe_key = if !plan.attach.dedupe_key.trim().is_empty() {
@@ -1031,9 +1214,9 @@ fn open_plan_failure(failure: &OpenPlanFailure) -> anyhow::Error {
 
 fn resolve_attach_command(
     plan: &ZedOpenPlan,
-    workspace_is_remote: bool,
+    attach_inside_target_remote_workspace: bool,
 ) -> Result<(String, Vec<String>)> {
-    if workspace_is_remote && plan.attach.mode == "ssh_shell" {
+    if attach_inside_target_remote_workspace && plan.attach.mode == "ssh_shell" {
         return tmux_attach_fallback(plan)
             .ok_or_else(|| anyhow!("daemon remote attach plan did not include a tmux target"));
     }
@@ -1215,6 +1398,18 @@ fn spawn_cwd(plan: &ZedOpenPlan, workspace_is_remote: bool) -> Option<PathBuf> {
     }
 
     non_empty_string(plan.attach.cwd.as_str()).map(PathBuf::from)
+}
+
+fn attach_inside_target_remote_workspace(
+    plan: &ZedOpenPlan,
+    matched_project_context: bool,
+    workspace_is_remote: bool,
+) -> bool {
+    plan.project.mode == "remote" && matched_project_context && workspace_is_remote
+}
+
+fn allow_source_workspace_attach_fallback(source_workspace_is_remote: bool) -> bool {
+    !source_workspace_is_remote
 }
 
 fn single_quote(value: &str) -> String {
@@ -1434,7 +1629,8 @@ mod tests {
             ..sample_plan()
         };
 
-        let task = build_spawn_task(&row, &plan, false).expect("remote argv attach should build");
+        let task =
+            build_spawn_task(&row, &plan, false, false).expect("remote argv attach should build");
         assert_eq!(
             task.id,
             TaskId("node:poros/acct:albertus@poros/sess:main/win:2".into())
@@ -1472,8 +1668,8 @@ mod tests {
             ..sample_plan()
         };
 
-        let error =
-            build_spawn_task(&row, &plan, false).expect_err("remote attach should require argv");
+        let error = build_spawn_task(&row, &plan, false, false)
+            .expect_err("remote attach should require argv");
         assert!(
             error
                 .to_string()
@@ -1504,7 +1700,8 @@ mod tests {
             ..sample_plan()
         };
 
-        let task = build_spawn_task(&row, &plan, false).expect("local fallback should build");
+        let task =
+            build_spawn_task(&row, &plan, false, false).expect("local fallback should build");
         assert_eq!(
             task.cwd,
             Some(PathBuf::from("/tmp/frontend-logging-cleanup"))
@@ -1552,8 +1749,8 @@ mod tests {
             ..sample_plan()
         };
 
-        let task =
-            build_spawn_task(&row, &plan, true).expect("remote workspace attach should build");
+        let task = build_spawn_task(&row, &plan, true, true)
+            .expect("remote workspace attach should build");
         assert_eq!(task.cwd, None);
         assert_eq!(task.command, None);
         assert_eq!(
@@ -1567,6 +1764,75 @@ mod tests {
                 title_override: None,
             }
         );
+    }
+
+    #[test]
+    fn build_spawn_task_suppresses_local_cwd_when_source_workspace_is_remote() {
+        let row = sample_row();
+        let plan = ZedOpenPlan {
+            project: vitermux::ZedProjectTarget {
+                mode: "local".into(),
+                remote_path: "/tmp/frontend-logging-cleanup".into(),
+                ..Default::default()
+            },
+            attach: vitermux::ZedAttachSpec {
+                mode: "local_shell".into(),
+                cwd: "/tmp/frontend-logging-cleanup".into(),
+                dedupe_key: "node:local/acct:me/sess:main/win:2".into(),
+                ..Default::default()
+            },
+            target_ref: vitermux::TargetRef {
+                tmux_session: "main".into(),
+                tmux_window: "2".into(),
+                ..Default::default()
+            },
+            ..sample_plan()
+        };
+
+        let task = build_spawn_task(&row, &plan, false, true)
+            .expect("fallback attach in a remote source workspace should build");
+        assert_eq!(task.cwd, None);
+    }
+
+    #[test]
+    fn remote_attach_uses_bare_tmux_only_for_matched_target_remote_workspace() {
+        let plan = ZedOpenPlan {
+            project: vitermux::ZedProjectTarget {
+                mode: "remote".into(),
+                remote_path: "/home/albertus/dev/agent-hud".into(),
+                ..Default::default()
+            },
+            ..sample_plan()
+        };
+
+        assert!(attach_inside_target_remote_workspace(&plan, true, true));
+        assert!(!attach_inside_target_remote_workspace(&plan, false, true));
+        assert!(!attach_inside_target_remote_workspace(&plan, true, false));
+    }
+
+    #[test]
+    fn local_attach_never_uses_remote_workspace_tmux_shortcut() {
+        let plan = ZedOpenPlan {
+            project: vitermux::ZedProjectTarget {
+                mode: "local".into(),
+                remote_path: "/tmp/frontend-logging-cleanup".into(),
+                ..Default::default()
+            },
+            attach: vitermux::ZedAttachSpec {
+                mode: "local_shell".into(),
+                cwd: "/tmp/frontend-logging-cleanup".into(),
+                ..Default::default()
+            },
+            ..sample_plan()
+        };
+
+        assert!(!attach_inside_target_remote_workspace(&plan, true, true));
+    }
+
+    #[test]
+    fn source_workspace_attach_fallback_is_only_allowed_from_local_workspace() {
+        assert!(allow_source_workspace_attach_fallback(false));
+        assert!(!allow_source_workspace_attach_fallback(true));
     }
 
     fn sample_row() -> WorkbenchRow {

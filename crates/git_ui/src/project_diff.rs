@@ -260,6 +260,13 @@ impl ProjectDiff {
         cx: &mut Context<Workspace>,
     ) {
         telemetry::event!("Git Diff Opened", source = "Agent Panel");
+        let intended_repo = workspace
+            .project()
+            .read(cx)
+            .git_store()
+            .read(cx)
+            .repository_and_path_for_project_path(&project_path, cx)
+            .map(|(repo, _)| repo);
         let existing = workspace
             .items_of_type::<Self>(cx)
             .find(|item| matches!(item.read(cx).diff_base(cx), DiffBase::Head));
@@ -279,8 +286,29 @@ impl ProjectDiff {
             );
             project_diff
         };
+        let mut retargeted_repo = false;
+        if let Some(intended) = &intended_repo {
+            let needs_switch = project_diff
+                .read(cx)
+                .branch_diff
+                .read(cx)
+                .repo()
+                .map_or(true, |current| current.read(cx).id != intended.read(cx).id);
+            if needs_switch {
+                project_diff.update(cx, |project_diff, cx| {
+                    project_diff.branch_diff.update(cx, |branch_diff, cx| {
+                        branch_diff.set_repo(Some(intended.clone()), cx);
+                    });
+                });
+                retargeted_repo = true;
+            }
+        }
         project_diff.update(cx, |project_diff, cx| {
-            project_diff.move_to_project_path(&project_path, window, cx);
+            if retargeted_repo {
+                project_diff.defer_move_to_project_path(&project_path, cx);
+            } else {
+                project_diff.move_to_project_path(&project_path, window, cx);
+            }
         });
     }
 
@@ -474,14 +502,25 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(git_repo) = self.branch_diff.read(cx).repo() else {
+        let Some(path_key) = self.path_key_for_project_path(project_path, cx) else {
             return;
+        };
+        self.move_to_path(path_key, window, cx)
+    }
+
+    fn defer_move_to_project_path(&mut self, project_path: &ProjectPath, cx: &mut Context<Self>) {
+        self.pending_scroll = self.path_key_for_project_path(project_path, cx);
+    }
+
+    fn path_key_for_project_path(&self, project_path: &ProjectPath, cx: &App) -> Option<PathKey> {
+        let Some(git_repo) = self.branch_diff.read(cx).repo() else {
+            return None;
         };
         let Some(repo_path) = git_repo
             .read(cx)
             .project_path_to_repo_path(project_path, cx)
         else {
-            return;
+            return None;
         };
         let status = git_repo
             .read(cx)
@@ -489,8 +528,10 @@ impl ProjectDiff {
             .map(|entry| entry.status)
             .unwrap_or(FileStatus::Untracked);
         let sort_prefix = sort_prefix(&git_repo.read(cx), &repo_path, status, cx);
-        let path_key = PathKey::with_sort_prefix(sort_prefix, repo_path.as_ref().clone());
-        self.move_to_path(path_key, window, cx)
+        Some(PathKey::with_sort_prefix(
+            sort_prefix,
+            repo_path.as_ref().clone(),
+        ))
     }
 
     pub fn active_path(&self, cx: &App) -> Option<ProjectPath> {
@@ -2797,5 +2838,212 @@ mod tests {
         let paths_b = diff_item.read_with(cx, |diff, cx| diff.excerpt_paths(cx));
         assert_eq!(paths_b.len(), 1);
         assert_eq!(*paths_b[0], *"b.txt");
+    }
+
+    #[gpui::test]
+    async fn test_deploy_at_project_path_retargets_existing_diff_to_project_path_repo(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project_a"),
+            json!({
+                ".git": {},
+                "a.txt": "CHANGED_A\n",
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            path!("/project_b"),
+            json!({
+                ".git": {},
+                "b.txt": "CHANGED_B\n",
+            }),
+        )
+        .await;
+
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project_a/.git")),
+            &[("a.txt", "original_a\n".to_string())],
+        );
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project_b/.git")),
+            &[("b.txt", "original_b\n".to_string())],
+        );
+
+        let project = Project::test(
+            fs.clone(),
+            [
+                Path::new(path!("/project_a")),
+                Path::new(path!("/project_b")),
+            ],
+            cx,
+        )
+        .await;
+
+        let (worktree_a_id, worktree_b_id) = project.read_with(cx, |project, cx| {
+            let mut worktrees: Vec<_> = project.worktrees(cx).collect();
+            worktrees.sort_by_key(|w| w.read(cx).abs_path());
+            (worktrees[0].read(cx).id(), worktrees[1].read(cx).id())
+        });
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            let git_store = workspace.project().read(cx).git_store().clone();
+            git_store.update(cx, |git_store, cx| {
+                git_store.set_active_repo_for_worktree(worktree_a_id, cx);
+            });
+        });
+
+        cx.focus(&workspace);
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                ProjectDiff::deploy_at_project_path(
+                    workspace,
+                    (worktree_a_id, rel_path("a.txt")).into(),
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let diff_item = workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<ProjectDiff>(cx).unwrap()
+        });
+        let paths_a = diff_item.read_with(cx, |diff, cx| diff.excerpt_paths(cx));
+        assert_eq!(paths_a.len(), 1);
+        assert_eq!(*paths_a[0], *"a.txt");
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                ProjectDiff::deploy_at_project_path(
+                    workspace,
+                    (worktree_b_id, rel_path("b.txt")).into(),
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let same_diff_item = workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<ProjectDiff>(cx).unwrap()
+        });
+        assert_eq!(diff_item.entity_id(), same_diff_item.entity_id());
+
+        let paths_b = same_diff_item.read_with(cx, |diff, cx| diff.excerpt_paths(cx));
+        assert_eq!(paths_b.len(), 1);
+        assert_eq!(*paths_b[0], *"b.txt");
+    }
+
+    #[gpui::test]
+    async fn test_deploy_at_project_path_retargets_when_relative_paths_match(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project_a"),
+            json!({
+                ".git": {},
+                "src": {
+                    "lib.rs": "CHANGED_A\n",
+                },
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            path!("/project_b"),
+            json!({
+                ".git": {},
+                "src": {
+                    "lib.rs": "CHANGED_B\n",
+                },
+            }),
+        )
+        .await;
+
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project_a/.git")),
+            &[("src/lib.rs", "original_a\n".to_string())],
+        );
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project_b/.git")),
+            &[("src/lib.rs", "original_b\n".to_string())],
+        );
+
+        let project = Project::test(
+            fs.clone(),
+            [
+                Path::new(path!("/project_a")),
+                Path::new(path!("/project_b")),
+            ],
+            cx,
+        )
+        .await;
+
+        let (worktree_a_id, worktree_b_id) = project.read_with(cx, |project, cx| {
+            let mut worktrees: Vec<_> = project.worktrees(cx).collect();
+            worktrees.sort_by_key(|w| w.read(cx).abs_path());
+            (worktrees[0].read(cx).id(), worktrees[1].read(cx).id())
+        });
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            let git_store = workspace.project().read(cx).git_store().clone();
+            git_store.update(cx, |git_store, cx| {
+                git_store.set_active_repo_for_worktree(worktree_a_id, cx);
+            });
+        });
+
+        cx.focus(&workspace);
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                ProjectDiff::deploy_at_project_path(
+                    workspace,
+                    (worktree_a_id, rel_path("src/lib.rs")).into(),
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let diff_item = workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<ProjectDiff>(cx).unwrap()
+        });
+        let active_path_a = diff_item
+            .read_with(cx, |diff, cx| diff.active_path(cx))
+            .unwrap();
+        assert_eq!(active_path_a.worktree_id, worktree_a_id);
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                ProjectDiff::deploy_at_project_path(
+                    workspace,
+                    (worktree_b_id, rel_path("src/lib.rs")).into(),
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let active_path_b = diff_item
+            .read_with(cx, |diff, cx| diff.active_path(cx))
+            .unwrap();
+        assert_eq!(active_path_b.worktree_id, worktree_b_id);
     }
 }

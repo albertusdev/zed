@@ -15,6 +15,7 @@ git_ui.workspace = true
 gpui.workspace = true
 menu.workspace = true
 parking_lot.workspace = true
+project.workspace = true
 remote.workspace = true
 remote_connection.workspace = true
 task.workspace = true
