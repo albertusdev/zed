@@ -9,10 +9,11 @@ use gpui::{
 };
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use parking_lot::Mutex;
-use project::ProjectPath;
+use project::{ProjectPath, git_store::branch_diff::DiffBase};
 use remote::{RemoteConnectionOptions, SshConnectionOptions, same_remote_connection_identity};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use task::{
     HideStrategy, RevealStrategy, RevealTarget, SaveStrategy, Shell, SpawnInTerminal, TaskId,
@@ -27,7 +28,7 @@ use vitermux::{
     ZedOpenPlan,
 };
 use workspace::{
-    MultiWorkspace, OpenMode, PathList, Toast, Workspace,
+    MultiWorkspace, OpenMode, Pane, PathList, Toast, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
     notifications::{DetachAndPromptErr, NotificationId},
 };
@@ -114,6 +115,8 @@ pub struct VitermuxPanel {
     rows: Vec<WorkbenchRow>,
     display_rows: Vec<DisplayRow>,
     selected_row_key: Option<SharedString>,
+    last_focused_terminal_key: Option<String>,
+    review_companion_enabled: Arc<AtomicBool>,
     active: bool,
     width: Pixels,
     _subscriptions: Vec<Subscription>,
@@ -125,16 +128,33 @@ impl VitermuxPanel {
         mut cx: AsyncWindowContext,
     ) -> Result<Entity<Self>> {
         let workspace_handle = workspace.clone();
-        workspace.update_in(&mut cx, |_workspace, _window, cx| {
-            cx.new(|cx| Self::new(workspace_handle.clone(), cx))
+        workspace.update_in(&mut cx, |_workspace, window, cx| {
+            cx.new(|cx| Self::new(workspace_handle.clone(), window, cx))
         })
     }
 
-    fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+    fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = VitermuxStore::global(cx);
         // The workbench inbox is operator-critical, so we prefer deterministic
         // far-jump selection reveal over cheaper visible-only measurement.
         let list_state = ListState::new(0, ListAlignment::Top, px(1000.)).measure_all();
+        let mut subscriptions = vec![cx.observe(&store, |this, _, cx| {
+            this.refresh_view_model(cx);
+            this.ensure_selection(cx);
+            this.scroll_selection_into_view();
+            cx.notify();
+        })];
+        if let Some(workspace_entity) = workspace.upgrade() {
+            subscriptions.push(cx.subscribe_in(
+                &workspace_entity,
+                window,
+                |this, workspace, event: &workspace::Event, window, cx| {
+                    if let workspace::Event::ActiveItemChanged = event {
+                        this.sync_to_focused_terminal(workspace.clone(), window, cx);
+                    }
+                },
+            ));
+        }
         let mut this = Self {
             workspace,
             store: store.clone(),
@@ -144,14 +164,11 @@ impl VitermuxPanel {
             rows: Vec::new(),
             display_rows: Vec::new(),
             selected_row_key: None,
+            last_focused_terminal_key: None,
+            review_companion_enabled: review_companion_enabled_flag(),
             active: false,
             width: px(336.0),
-            _subscriptions: vec![cx.observe(&store, |this, _, cx| {
-                this.refresh_view_model(cx);
-                this.ensure_selection(cx);
-                this.scroll_selection_into_view();
-                cx.notify();
-            })],
+            _subscriptions: subscriptions,
         };
         this.refresh_view_model(cx);
         this.ensure_selection(cx);
@@ -349,8 +366,60 @@ impl VitermuxPanel {
             return;
         }
 
-        self.fetch_and_open_review(row, window, cx)
+        self.review_companion_enabled.store(true, Ordering::Release);
+        self.fetch_and_open_review(row, ReviewOpenMode::ExplicitOpen, window, cx)
             .detach_and_prompt_err("Vitermux Review Open Failed", window, cx, |_, _, _| None);
+    }
+
+    fn sync_to_focused_terminal(
+        &mut self,
+        workspace: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(focused_terminal) = focused_terminal_match(&self.rows, workspace.read(cx), cx)
+        else {
+            return;
+        };
+        let terminal_key = focused_terminal.task_label.clone();
+        let row = focused_terminal.row;
+        let terminal_pane = focused_terminal.pane;
+
+        if self.selected_row_key.as_ref().map(|value| value.as_ref()) != Some(row.row_key.as_ref())
+        {
+            self.selected_row_key = Some(row.row_key.clone());
+            self.scroll_selection_into_view();
+            cx.notify();
+        }
+
+        if !self.review_companion_enabled.load(Ordering::Acquire) {
+            return;
+        }
+
+        let has_companion_for_terminal = workspace.update(cx, |workspace, cx| {
+            find_review_diff_pane_for_terminal(workspace, &terminal_pane, cx).is_some()
+        });
+        let same_terminal_key =
+            self.last_focused_terminal_key.as_deref() == Some(terminal_key.as_str());
+        self.last_focused_terminal_key = Some(terminal_key);
+
+        if same_terminal_key && has_companion_for_terminal {
+            return;
+        }
+
+        self.fetch_and_open_review(
+            row,
+            ReviewOpenMode::SyncCompanion {
+                expected_terminal_key: self
+                    .last_focused_terminal_key
+                    .clone()
+                    .expect("focused terminal key was just set"),
+                ensure_companion_pane: !has_companion_for_terminal,
+            },
+            window,
+            cx,
+        )
+        .detach_and_log_err(cx);
     }
 
     fn fetch_and_open(
@@ -374,6 +443,7 @@ impl VitermuxPanel {
         }
         let pending_open_keys = self.pending_open_keys.clone();
         let requesting_window = window.window_handle().downcast::<MultiWorkspace>();
+        let preferred_terminal_key = self.last_focused_terminal_key.clone();
         let session_key = row
             .session_key
             .clone()
@@ -464,11 +534,14 @@ impl VitermuxPanel {
                     return Ok(());
                 }
 
+                let preferred_pane = workspace.update_in(cx, |workspace, _window, cx| {
+                    preferred_terminal_spawn_pane(workspace, preferred_terminal_key.as_deref(), cx)
+                })?;
                 let Some(terminal_panel) = terminal_panel else {
                     return Err(anyhow!("terminal panel is not available"));
                 };
                 let terminal_task = terminal_panel.update_in(cx, |panel, window, cx| {
-                    panel.spawn_task(&spawn_task, window, cx)
+                    panel.spawn_task_in_center_pane(&spawn_task, preferred_pane, window, cx)
                 })?;
                 terminal_task.await?;
                 Ok(())
@@ -483,6 +556,7 @@ impl VitermuxPanel {
     fn fetch_and_open_review(
         &self,
         row: WorkbenchRow,
+        mode: ReviewOpenMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
@@ -511,9 +585,27 @@ impl VitermuxPanel {
                 ));
             }
 
-            let resolved_workspace =
-                resolve_project_workspace_for_plan(workspace, requesting_window, &plan, cx).await?;
-            let workspace = resolved_workspace.workspace;
+            let workspace = match mode {
+                ReviewOpenMode::ExplicitOpen => {
+                    resolve_project_workspace_for_plan(workspace, requesting_window, &plan, cx)
+                        .await?
+                        .workspace
+                }
+                ReviewOpenMode::SyncCompanion { .. } => workspace,
+            };
+            if let ReviewOpenMode::SyncCompanion {
+                expected_terminal_key,
+                ..
+            } = &mode
+            {
+                let still_focused = workspace.update_in(cx, |workspace, _window, cx| {
+                    focused_terminal_task_label(workspace, cx).as_deref()
+                        == Some(expected_terminal_key.as_str())
+                })?;
+                if !still_focused {
+                    return Ok(());
+                }
+            }
             let Some(project_path) = sync_workspace_project_context_for_plan(
                 workspace.clone(),
                 &plan,
@@ -526,8 +618,67 @@ impl VitermuxPanel {
                     "daemon open plan did not resolve a project path for review"
                 ));
             };
-            workspace.update_in(cx, |workspace, window, cx| {
-                ProjectDiff::deploy_at_project_path(workspace, project_path, window, cx);
+            workspace.update_in(cx, |workspace, window, cx| match mode {
+                ReviewOpenMode::ExplicitOpen => {
+                    let review_pane = terminal_pane_for_row(workspace, &row, cx)
+                        .map(|terminal_pane| {
+                            workspace.adjacent_pane_from(
+                                terminal_pane,
+                                workspace::SplitDirection::Right,
+                                window,
+                                cx,
+                            )
+                        })
+                        .or_else(|| find_review_diff_pane(workspace, cx))
+                        .unwrap_or_else(|| workspace.adjacent_pane(window, cx));
+                    ProjectDiff::deploy_at_project_path_in_pane(
+                        workspace,
+                        review_pane,
+                        project_path,
+                        true,
+                        true,
+                        true,
+                        window,
+                        cx,
+                    );
+                }
+                ReviewOpenMode::SyncCompanion {
+                    expected_terminal_key,
+                    ensure_companion_pane,
+                } => {
+                    if focused_terminal_task_label(workspace, cx).as_deref()
+                        != Some(expected_terminal_key.as_str())
+                    {
+                        return;
+                    }
+                    if let Some(terminal_pane) = terminal_pane_for_row(workspace, &row, cx) {
+                        let should_create_companion = ensure_companion_pane
+                            || find_review_diff_pane_for_terminal(workspace, &terminal_pane, cx)
+                                .is_none();
+                        let review_pane = if should_create_companion {
+                            Some(workspace.adjacent_pane_from(
+                                terminal_pane.clone(),
+                                workspace::SplitDirection::Right,
+                                window,
+                                cx,
+                            ))
+                        } else {
+                            find_review_diff_pane_for_terminal(workspace, &terminal_pane, cx)
+                        };
+                        if let Some(review_pane) = review_pane {
+                            ProjectDiff::deploy_at_project_path_in_pane(
+                                workspace,
+                                review_pane,
+                                project_path,
+                                should_create_companion,
+                                false,
+                                false,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                }
             })?;
             Ok(())
         })
@@ -975,6 +1126,15 @@ enum ProjectContextSyncMode {
     RequireGitRepository,
 }
 
+#[derive(Clone)]
+enum ReviewOpenMode {
+    ExplicitOpen,
+    SyncCompanion {
+        expected_terminal_key: String,
+        ensure_companion_pane: bool,
+    },
+}
+
 async fn resolve_project_workspace_for_plan(
     source_workspace: Entity<Workspace>,
     requesting_window: Option<WindowHandle<MultiWorkspace>>,
@@ -1313,6 +1473,126 @@ fn focus_existing_terminal(
     false
 }
 
+struct FocusedTerminalMatch {
+    task_label: String,
+    row: WorkbenchRow,
+    pane: Entity<Pane>,
+}
+
+fn focused_terminal_match(
+    rows: &[WorkbenchRow],
+    workspace: &Workspace,
+    cx: &App,
+) -> Option<FocusedTerminalMatch> {
+    let active_item = workspace.active_item(cx)?;
+    let pane = workspace.pane_for(active_item.as_ref())?;
+    let terminal_view = active_item.act_as::<TerminalView>(cx)?;
+    let task = terminal_view.read(cx).terminal().read(cx).task()?;
+    let terminal_key = task.spawned_task.full_label.clone();
+    let row = row_for_terminal_task_label(rows, &terminal_key)?;
+    Some(FocusedTerminalMatch {
+        task_label: terminal_key,
+        row,
+        pane,
+    })
+}
+
+fn focused_terminal_task_label(workspace: &Workspace, cx: &App) -> Option<String> {
+    let active_item = workspace.active_item(cx)?;
+    let terminal_view = active_item.act_as::<TerminalView>(cx)?;
+    let task = terminal_view.read(cx).terminal().read(cx).task()?;
+    Some(task.spawned_task.full_label.clone())
+}
+
+fn row_for_terminal_task_label(rows: &[WorkbenchRow], terminal_key: &str) -> Option<WorkbenchRow> {
+    rows.iter()
+        .find(|row| row.dedupe_key.as_ref() == terminal_key || row.row_key.as_ref() == terminal_key)
+        .cloned()
+}
+
+fn review_companion_enabled_flag() -> Arc<AtomicBool> {
+    static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    FLAG.get_or_init(|| Arc::new(AtomicBool::new(false)))
+        .clone()
+}
+
+fn terminal_pane_for_row(
+    workspace: &Workspace,
+    row: &WorkbenchRow,
+    cx: &App,
+) -> Option<Entity<Pane>> {
+    terminal_pane_for_task_label(workspace, row.dedupe_key.as_ref(), cx)
+        .or_else(|| terminal_pane_for_task_label(workspace, row.row_key.as_ref(), cx))
+}
+
+fn terminal_pane_for_task_label(
+    workspace: &Workspace,
+    terminal_key: &str,
+    cx: &App,
+) -> Option<Entity<Pane>> {
+    let mut fallback = None;
+    for pane in workspace.panes() {
+        let has_match = pane.read(cx).items().into_iter().any(|item| {
+            item.act_as::<TerminalView>(cx)
+                .is_some_and(|terminal_view| {
+                    terminal_view
+                        .read(cx)
+                        .terminal()
+                        .read(cx)
+                        .task()
+                        .is_some_and(|task| task.spawned_task.full_label == terminal_key)
+                })
+        });
+        if !has_match {
+            continue;
+        }
+        if !pane_has_review_diff(pane, cx) {
+            return Some(pane.clone());
+        }
+        fallback.get_or_insert_with(|| pane.clone());
+    }
+    fallback
+}
+
+fn preferred_terminal_spawn_pane(
+    workspace: &mut Workspace,
+    preferred_terminal_key: Option<&str>,
+    cx: &App,
+) -> Entity<Pane> {
+    preferred_terminal_key
+        .and_then(|terminal_key| terminal_pane_for_task_label(workspace, terminal_key, cx))
+        .or_else(|| {
+            let review_pane = find_review_diff_pane(workspace, cx)?;
+            workspace.pane_in_direction_from(&review_pane, workspace::SplitDirection::Left, cx)
+        })
+        .unwrap_or_else(|| workspace.active_pane().clone())
+}
+
+fn find_review_diff_pane(workspace: &Workspace, cx: &App) -> Option<Entity<Pane>> {
+    workspace
+        .panes()
+        .iter()
+        .rev()
+        .find(|pane| pane_has_review_diff(pane, cx))
+        .cloned()
+}
+
+fn find_review_diff_pane_for_terminal(
+    workspace: &mut Workspace,
+    terminal_pane: &Entity<Pane>,
+    cx: &App,
+) -> Option<Entity<Pane>> {
+    let review_pane =
+        workspace.pane_in_direction_from(terminal_pane, workspace::SplitDirection::Right, cx)?;
+    pane_has_review_diff(&review_pane, cx).then_some(review_pane)
+}
+
+fn pane_has_review_diff(pane: &Entity<Pane>, cx: &App) -> bool {
+    pane.read(cx)
+        .items_of_type::<ProjectDiff>()
+        .any(|item| matches!(item.read(cx).diff_base(cx), DiffBase::Head))
+}
+
 fn window_label(window: &TmuxWindow) -> String {
     first_non_empty([
         window.binding.workspace_label.as_str(),
@@ -1603,6 +1883,26 @@ mod tests {
             selected_display_row_index_in(&display_rows, Some(&SharedString::from("missing"))),
             None
         );
+    }
+
+    #[test]
+    fn row_for_terminal_task_label_matches_dedupe_key_and_row_key() {
+        let row = sample_row();
+        let rows = vec![row.clone()];
+
+        assert_eq!(
+            row_for_terminal_task_label(&rows, row.dedupe_key.as_ref())
+                .expect("dedupe key should match")
+                .row_key,
+            row.row_key
+        );
+        assert_eq!(
+            row_for_terminal_task_label(&rows, row.row_key.as_ref())
+                .expect("row key should match")
+                .dedupe_key,
+            row.dedupe_key
+        );
+        assert!(row_for_terminal_task_label(&rows, "missing").is_none());
     }
 
     #[test]

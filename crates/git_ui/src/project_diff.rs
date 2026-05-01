@@ -40,7 +40,7 @@ use theme::ActiveTheme;
 use ui::{DiffStat, Divider, KeyBinding, Tooltip, prelude::*, vertical_divider};
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
-    CloseActiveItem, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
+    CloseActiveItem, ItemNavHistory, Pane, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
     ToolbarItemView, Workspace,
     item::{Item, ItemEvent, ItemHandle, SaveOptions, TabContentParams},
     notifications::NotifyTaskExt,
@@ -259,7 +259,32 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        telemetry::event!("Git Diff Opened", source = "Agent Panel");
+        let pane = workspace.active_pane().clone();
+        Self::deploy_at_project_path_in_pane(
+            workspace,
+            pane,
+            project_path,
+            true,
+            true,
+            true,
+            window,
+            cx,
+        );
+    }
+
+    pub fn deploy_at_project_path_in_pane(
+        workspace: &mut Workspace,
+        pane: Entity<Pane>,
+        project_path: ProjectPath,
+        create_if_missing: bool,
+        activate_pane: bool,
+        focus_item: bool,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        if create_if_missing || activate_pane || focus_item {
+            telemetry::event!("Git Diff Opened", source = "Agent Panel");
+        }
         let intended_repo = workspace
             .project()
             .read(cx)
@@ -267,20 +292,25 @@ impl ProjectDiff {
             .read(cx)
             .repository_and_path_for_project_path(&project_path, cx)
             .map(|(repo, _)| repo);
-        let existing = workspace
-            .items_of_type::<Self>(cx)
+        let existing = pane
+            .read(cx)
+            .items_of_type::<Self>()
             .find(|item| matches!(item.read(cx).diff_base(cx), DiffBase::Head));
         let project_diff = if let Some(existing) = existing {
-            workspace.activate_item(&existing, true, true, window, cx);
+            workspace.activate_item(&existing, activate_pane, focus_item, window, cx);
             existing
+        } else if !create_if_missing {
+            return false;
         } else {
             let workspace_handle = cx.entity();
             let project_diff =
                 cx.new(|cx| Self::new(workspace.project().clone(), workspace_handle, window, cx));
-            workspace.add_item_to_active_pane(
+            workspace.add_item(
+                pane.clone(),
                 Box::new(project_diff.clone()),
                 None,
-                true,
+                activate_pane,
+                focus_item,
                 window,
                 cx,
             );
@@ -310,6 +340,7 @@ impl ProjectDiff {
                 project_diff.move_to_project_path(&project_path, window, cx);
             }
         });
+        true
     }
 
     pub fn autoscroll(&self, cx: &mut Context<Self>) {
@@ -1779,7 +1810,7 @@ mod tests {
         rel_path::{RelPath, rel_path},
     };
 
-    use workspace::MultiWorkspace;
+    use workspace::{MultiWorkspace, SplitDirection};
 
     use super::*;
 
@@ -2941,6 +2972,159 @@ mod tests {
         let paths_b = same_diff_item.read_with(cx, |diff, cx| diff.excerpt_paths(cx));
         assert_eq!(paths_b.len(), 1);
         assert_eq!(*paths_b[0], *"b.txt");
+    }
+
+    #[gpui::test]
+    async fn test_deploy_at_project_path_in_pane_retargets_existing_diff_without_stealing_focus(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project_a"),
+            json!({
+                ".git": {},
+                "a.txt": "CHANGED_A\n",
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            path!("/project_b"),
+            json!({
+                ".git": {},
+                "b.txt": "CHANGED_B\n",
+            }),
+        )
+        .await;
+
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project_a/.git")),
+            &[("a.txt", "original_a\n".to_string())],
+        );
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project_b/.git")),
+            &[("b.txt", "original_b\n".to_string())],
+        );
+
+        let project = Project::test(
+            fs.clone(),
+            [
+                Path::new(path!("/project_a")),
+                Path::new(path!("/project_b")),
+            ],
+            cx,
+        )
+        .await;
+
+        let (worktree_a_id, worktree_b_id) = project.read_with(cx, |project, cx| {
+            let mut worktrees: Vec<_> = project.worktrees(cx).collect();
+            worktrees.sort_by_key(|w| w.read(cx).abs_path());
+            (worktrees[0].read(cx).id(), worktrees[1].read(cx).id())
+        });
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            let git_store = workspace.project().read(cx).git_store().clone();
+            git_store.update(cx, |git_store, cx| {
+                git_store.set_active_repo_for_worktree(worktree_a_id, cx);
+            });
+        });
+
+        let (left_pane, right_pane) = cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                let left = workspace.active_pane().clone();
+                let right = workspace.split_pane(left.clone(), SplitDirection::Right, window, cx);
+                (left, right)
+            })
+        });
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                assert!(!ProjectDiff::deploy_at_project_path_in_pane(
+                    workspace,
+                    right_pane.clone(),
+                    (worktree_b_id, rel_path("b.txt")).into(),
+                    false,
+                    false,
+                    false,
+                    window,
+                    cx,
+                ));
+            });
+        });
+        cx.run_until_parked();
+
+        let no_diff_in_right_pane = right_pane.read_with(cx, |pane, _cx| {
+            pane.items_of_type::<ProjectDiff>().next().is_none()
+        });
+        assert!(no_diff_in_right_pane);
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                assert!(ProjectDiff::deploy_at_project_path_in_pane(
+                    workspace,
+                    right_pane.clone(),
+                    (worktree_a_id, rel_path("a.txt")).into(),
+                    true,
+                    true,
+                    true,
+                    window,
+                    cx,
+                ));
+            });
+        });
+        cx.run_until_parked();
+
+        let diff_item = right_pane.read_with(cx, |pane, _cx| {
+            pane.items_of_type::<ProjectDiff>()
+                .next()
+                .expect("right pane should contain a diff")
+        });
+        let paths_a = diff_item.read_with(cx, |diff, cx| diff.excerpt_paths(cx));
+        assert_eq!(paths_a.len(), 1);
+        assert_eq!(*paths_a[0], *"a.txt");
+
+        cx.update(|window, cx| {
+            window.focus(&left_pane.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+        let active_before =
+            workspace.update(cx, |workspace, _| workspace.active_pane().entity_id());
+        assert_eq!(active_before, left_pane.entity_id());
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                assert!(ProjectDiff::deploy_at_project_path_in_pane(
+                    workspace,
+                    right_pane.clone(),
+                    (worktree_b_id, rel_path("b.txt")).into(),
+                    false,
+                    false,
+                    false,
+                    window,
+                    cx,
+                ));
+            });
+        });
+        cx.run_until_parked();
+
+        let same_diff_item = right_pane.read_with(cx, |pane, _cx| {
+            pane.items_of_type::<ProjectDiff>()
+                .next()
+                .expect("right pane should still contain a diff")
+        });
+        assert_eq!(diff_item.entity_id(), same_diff_item.entity_id());
+        let paths_b = same_diff_item.read_with(cx, |diff, cx| diff.excerpt_paths(cx));
+        assert_eq!(paths_b.len(), 1);
+        assert_eq!(*paths_b[0], *"b.txt");
+
+        let active_after = workspace.update(cx, |workspace, _| workspace.active_pane().entity_id());
+        assert_eq!(active_after, left_pane.entity_id());
     }
 
     #[gpui::test]

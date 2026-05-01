@@ -625,6 +625,52 @@ impl TerminalPanel {
         cx.spawn(async move |_, _| rx.await?)
     }
 
+    pub fn spawn_task_in_center_pane(
+        &mut self,
+        task: &SpawnInTerminal,
+        pane: Entity<Pane>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return Task::ready(Err(anyhow!("failed to read workspace")));
+        };
+
+        let project = workspace.read(cx).project().read(cx);
+
+        if project.is_via_collab() {
+            return Task::ready(Err(anyhow!("cannot spawn tasks as a guest")));
+        }
+
+        let remote_client = project.remote_client();
+        let is_windows = project.path_style(cx).is_windows();
+        let remote_shell = remote_client
+            .as_ref()
+            .and_then(|remote_client| remote_client.read(cx).shell());
+
+        let shell = if let Some(remote_shell) = remote_shell
+            && task.shell == Shell::System
+        {
+            Shell::Program(remote_shell)
+        } else {
+            task.shell.clone()
+        };
+
+        let task = prepare_task_for_spawn(task, &shell, is_windows);
+
+        self.workspace
+            .update(cx, |workspace, cx| {
+                Self::add_center_terminal_in_pane(
+                    workspace,
+                    pane,
+                    window,
+                    cx,
+                    move |project, cx| project.create_terminal_task(task, cx),
+                )
+            })
+            .unwrap_or_else(|e| Task::ready(Err(e)))
+    }
+
     fn spawn_in_new_terminal(
         &mut self,
         spawn_task: SpawnInTerminal,
@@ -759,6 +805,21 @@ impl TerminalPanel {
         ) -> Task<Result<Entity<Terminal>>>
         + 'static,
     ) -> Task<Result<WeakEntity<Terminal>>> {
+        let pane = workspace.active_pane().clone();
+        Self::add_center_terminal_in_pane(workspace, pane, window, cx, create_terminal)
+    }
+
+    pub fn add_center_terminal_in_pane(
+        workspace: &mut Workspace,
+        pane: Entity<Pane>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+        create_terminal: impl FnOnce(
+            &mut Project,
+            &mut Context<Project>,
+        ) -> Task<Result<Entity<Terminal>>>
+        + 'static,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
         if !is_enabled_in_workspace(workspace, cx) {
             return Task::ready(Err(anyhow!(
                 "terminal not yet supported for remote projects"
@@ -769,6 +830,12 @@ impl TerminalPanel {
             let terminal = project.update(cx, create_terminal)?.await?;
 
             workspace.update_in(cx, |workspace, window, cx| {
+                let target_pane = workspace
+                    .panes()
+                    .iter()
+                    .find(|candidate| **candidate == pane)
+                    .cloned()
+                    .unwrap_or_else(|| workspace.active_pane().clone());
                 let terminal_view = cx.new(|cx| {
                     TerminalView::new(
                         terminal.clone(),
@@ -779,7 +846,15 @@ impl TerminalPanel {
                         cx,
                     )
                 });
-                workspace.add_item_to_active_pane(Box::new(terminal_view), None, true, window, cx);
+                workspace.add_item(
+                    target_pane,
+                    Box::new(terminal_view),
+                    None,
+                    true,
+                    true,
+                    window,
+                    cx,
+                );
             })?;
             Ok(terminal.downgrade())
         })

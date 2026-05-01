@@ -5148,14 +5148,24 @@ impl Workspace {
         self.center.bounding_box_for_pane(pane)
     }
 
+    pub fn pane_in_direction_from(
+        &mut self,
+        pane: &Entity<Pane>,
+        direction: SplitDirection,
+        cx: &App,
+    ) -> Option<Entity<Pane>> {
+        self.center
+            .find_pane_in_direction(pane, direction, cx)
+            .cloned()
+    }
+
     pub fn find_pane_in_direction(
         &mut self,
         direction: SplitDirection,
         cx: &App,
     ) -> Option<Entity<Pane>> {
-        self.center
-            .find_pane_in_direction(&self.active_pane, direction, cx)
-            .cloned()
+        let active_pane = self.active_pane.clone();
+        self.pane_in_direction_from(&active_pane, direction, cx)
     }
 
     pub fn swap_pane_in_direction(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
@@ -5563,11 +5573,19 @@ impl Workspace {
         self.active_pane().clone()
     }
 
+    pub fn adjacent_pane_from(
+        &mut self,
+        pane: Entity<Pane>,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Pane> {
+        self.pane_in_direction_from(&pane, direction, cx)
+            .unwrap_or_else(|| self.split_pane(pane, direction, window, cx))
+    }
+
     pub fn adjacent_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Pane> {
-        self.find_pane_in_direction(SplitDirection::Right, cx)
-            .unwrap_or_else(|| {
-                self.split_pane(self.active_pane.clone(), SplitDirection::Right, window, cx)
-            })
+        self.adjacent_pane_from(self.active_pane.clone(), SplitDirection::Right, window, cx)
     }
 
     pub fn pane_for(&self, handle: &dyn ItemHandle) -> Option<Entity<Pane>> {
