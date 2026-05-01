@@ -1,0 +1,20 @@
+[package]
+name = "vitermux_ui"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+collections.workspace = true
+gpui.workspace = true
+parking_lot.workspace = true
+task.workspace = true
+terminal_view.workspace = true
+ui.workspace = true
+vitermux.workspace = true
+workspace.workspace = true

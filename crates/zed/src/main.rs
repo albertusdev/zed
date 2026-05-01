@@ -718,6 +718,8 @@ fn main() {
         });
         vim::init(cx);
         terminal_view::init(cx);
+        vitermux::init(cx);
+        vitermux_ui::init(cx);
         journal::init(app_state.clone(), cx);
         encoding_selector::init(cx);
         language_selector::init(cx);

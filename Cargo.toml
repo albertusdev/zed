@@ -213,6 +213,8 @@ members = [
     "crates/ui_prompt",
     "crates/util",
     "crates/util_macros",
+    "crates/vitermux",
+    "crates/vitermux_ui",
     "crates/vim",
     "crates/vim_mode_setting",
     "crates/watch",
@@ -468,6 +470,8 @@ ui_macros = { path = "crates/ui_macros" }
 ui_prompt = { path = "crates/ui_prompt" }
 util = { path = "crates/util" }
 util_macros = { path = "crates/util_macros" }
+vitermux = { path = "crates/vitermux" }
+vitermux_ui = { path = "crates/vitermux_ui" }
 vim = { path = "crates/vim" }
 vim_mode_setting = { path = "crates/vim_mode_setting" }
 which_key = { path = "crates/which_key" }

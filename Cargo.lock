@@ -19520,6 +19520,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "vitermux"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures 0.3.32",
+ "gpui",
+ "http_client",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
+name = "vitermux_ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "gpui",
+ "parking_lot",
+ "task",
+ "terminal_view",
+ "ui",
+ "vitermux",
+ "workspace",
+]
+
+[[package]]
 name = "vscode_theme"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22506,6 +22534,8 @@ dependencies = [
  "uuid",
  "vim",
  "vim_mode_setting",
+ "vitermux",
+ "vitermux_ui",
  "watch",
  "web_search",
  "web_search_providers",

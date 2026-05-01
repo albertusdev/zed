@@ -84,6 +84,7 @@ use util::rel_path::RelPath;
 use util::{ResultExt, asset_str, maybe};
 use uuid::Uuid;
 use vim_mode_setting::VimModeSetting;
+use vitermux_ui::VitermuxPanel;
 use workspace::notifications::{NotificationId, dismiss_app_notification, show_app_notification};
 
 use workspace::{
@@ -710,6 +711,7 @@ fn show_software_emulation_warning_if_needed(
 
 fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<anyhow::Result<()>> {
     cx.spawn_in(window, async move |workspace_handle, cx| {
+        let vitermux_panel = VitermuxPanel::load(workspace_handle.clone(), cx.clone());
         let project_panel = ProjectPanel::load(workspace_handle.clone(), cx.clone());
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
@@ -734,14 +736,23 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         }
 
         futures::join!(
+            add_panel_when_ready(vitermux_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
-            initialize_agent_panel(workspace_handle, cx.clone()).map(|r| r.log_err()),
+            initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
+
+        workspace_handle
+            .update_in(cx, |workspace, window, cx| {
+                if workspace.panel::<VitermuxPanel>(cx).is_some() {
+                    workspace.open_panel::<VitermuxPanel>(window, cx);
+                }
+            })
+            .log_err();
 
         anyhow::Ok(())
     })
