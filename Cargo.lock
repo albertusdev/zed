@@ -19538,6 +19538,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collections",
+ "editor",
+ "fs",
  "git_ui",
  "gpui",
  "menu",
@@ -19545,9 +19547,14 @@ dependencies = [
  "project",
  "remote",
  "remote_connection",
+ "serde_json",
+ "settings",
  "task",
  "terminal_view",
+ "theme",
+ "theme_settings",
  "ui",
+ "util",
  "vitermux",
  "workspace",
 ]

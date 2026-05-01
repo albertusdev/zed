@@ -444,6 +444,7 @@ impl VitermuxPanel {
         let pending_open_keys = self.pending_open_keys.clone();
         let requesting_window = window.window_handle().downcast::<MultiWorkspace>();
         let preferred_terminal_key = self.last_focused_terminal_key.clone();
+        let review_companion_enabled = self.review_companion_enabled.load(Ordering::Acquire);
         let session_key = row
             .session_key
             .clone()
@@ -467,6 +468,20 @@ impl VitermuxPanel {
                     )
                 })?;
                 if did_focus_existing {
+                    if review_companion_enabled {
+                        let plan = client.fetch_open_plan(&session_key).await?;
+                        if let Err(error) = sync_review_companion_for_terminal_open(
+                            workspace.clone(),
+                            &row,
+                            &plan,
+                            &open_key,
+                            cx,
+                        )
+                        .await
+                        {
+                            let _ = error;
+                        }
+                    }
                     return Ok(());
                 }
 
@@ -519,18 +534,32 @@ impl VitermuxPanel {
                     spawn_inside_target_remote_workspace,
                     workspace_is_remote,
                 )?;
+                let terminal_key = spawn_task.full_label.clone();
                 let terminal_panel =
                     workspace.read_with(cx, |workspace, cx| workspace.panel::<TerminalPanel>(cx));
                 let did_focus_existing = workspace.update_in(cx, |workspace, window, cx| {
                     focus_existing_terminal(
                         workspace,
                         terminal_panel.clone(),
-                        &spawn_task.full_label,
+                        &terminal_key,
                         window,
                         cx,
                     )
                 })?;
                 if did_focus_existing {
+                    if review_companion_enabled {
+                        if let Err(error) = sync_review_companion_for_terminal_open(
+                            workspace.clone(),
+                            &row,
+                            &plan,
+                            &terminal_key,
+                            cx,
+                        )
+                        .await
+                        {
+                            let _ = error;
+                        }
+                    }
                     return Ok(());
                 }
 
@@ -544,6 +573,19 @@ impl VitermuxPanel {
                     panel.spawn_task_in_center_pane(&spawn_task, preferred_pane, window, cx)
                 })?;
                 terminal_task.await?;
+                if review_companion_enabled {
+                    if let Err(error) = sync_review_companion_for_terminal_open(
+                        workspace.clone(),
+                        &row,
+                        &plan,
+                        &terminal_key,
+                        cx,
+                    )
+                    .await
+                    {
+                        let _ = error;
+                    }
+                }
                 Ok(())
             }
             .await;
@@ -651,33 +693,15 @@ impl VitermuxPanel {
                     {
                         return;
                     }
-                    if let Some(terminal_pane) = terminal_pane_for_row(workspace, &row, cx) {
-                        let should_create_companion = ensure_companion_pane
-                            || find_review_diff_pane_for_terminal(workspace, &terminal_pane, cx)
-                                .is_none();
-                        let review_pane = if should_create_companion {
-                            Some(workspace.adjacent_pane_from(
-                                terminal_pane.clone(),
-                                workspace::SplitDirection::Right,
-                                window,
-                                cx,
-                            ))
-                        } else {
-                            find_review_diff_pane_for_terminal(workspace, &terminal_pane, cx)
-                        };
-                        if let Some(review_pane) = review_pane {
-                            ProjectDiff::deploy_at_project_path_in_pane(
-                                workspace,
-                                review_pane,
-                                project_path,
-                                should_create_companion,
-                                false,
-                                false,
-                                window,
-                                cx,
-                            );
-                        }
-                    }
+                    deploy_review_companion_for_terminal_key(
+                        workspace,
+                        &row,
+                        project_path,
+                        expected_terminal_key.as_str(),
+                        ensure_companion_pane,
+                        window,
+                        cx,
+                    );
                 }
             })?;
             Ok(())
@@ -1071,7 +1095,7 @@ async fn ensure_project_workspace_for_plan(
     };
 
     let connection_options = project_connection_options(plan)?;
-    let target_paths = vec![target_path];
+    let target_paths = vec![target_path.clone()];
 
     if let Some(existing_workspace) =
         requesting_window.update(cx, |multi_workspace, window, cx| {
@@ -1189,6 +1213,90 @@ async fn sync_workspace_project_context_for_plan(
     }
 
     Ok(Some(project_path))
+}
+
+async fn sync_review_companion_for_terminal_open(
+    workspace: Entity<Workspace>,
+    row: &WorkbenchRow,
+    plan: &ZedOpenPlan,
+    terminal_key: &str,
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
+    if let Some(failure) = plan.failure.as_ref() {
+        return Err(open_plan_failure(failure));
+    }
+
+    let Some(project_path) = sync_workspace_project_context_for_plan(
+        workspace.clone(),
+        plan,
+        ProjectContextSyncMode::RequireGitRepository,
+        cx,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        deploy_review_companion_for_terminal_key(
+            workspace,
+            row,
+            project_path,
+            terminal_key,
+            false,
+            window,
+            cx,
+        );
+    })?;
+
+    Ok(())
+}
+
+fn deploy_review_companion_for_terminal_key(
+    workspace: &mut Workspace,
+    row: &WorkbenchRow,
+    project_path: ProjectPath,
+    terminal_key: &str,
+    ensure_companion_pane: bool,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if focused_terminal_task_label(workspace, cx).as_deref() != Some(terminal_key) {
+        return;
+    }
+
+    let terminal_pane =
+        terminal_pane_for_task_label(workspace, terminal_key, cx).or_else(|| {
+            terminal_pane_for_row(workspace, row, cx)
+        });
+    let Some(terminal_pane) = terminal_pane else {
+        return;
+    };
+
+    let should_create_companion = ensure_companion_pane
+        || find_review_diff_pane_for_terminal(workspace, &terminal_pane, cx).is_none();
+    let review_pane = if should_create_companion {
+        Some(workspace.adjacent_pane_from(
+            terminal_pane.clone(),
+            workspace::SplitDirection::Right,
+            window,
+            cx,
+        ))
+    } else {
+        find_review_diff_pane_for_terminal(workspace, &terminal_pane, cx)
+    };
+    if let Some(review_pane) = review_pane {
+        ProjectDiff::deploy_at_project_path_in_pane(
+            workspace,
+            review_pane,
+            project_path,
+            should_create_companion,
+            false,
+            false,
+            window,
+            cx,
+        );
+    }
 }
 
 async fn wait_for_project_path_repository(
@@ -1728,7 +1836,15 @@ fn selected_display_row_index_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use project::Project;
+    use serde_json::json;
+    use settings::SettingsStore;
     use task::TaskId;
+    use terminal_view::terminal_panel::TerminalPanel;
+    use util::{path, rel_path::rel_path};
+    use workspace::MultiWorkspace;
 
     #[test]
     fn flatten_rows_uses_window_session_key_and_dedupe_identity() {
@@ -2135,6 +2251,99 @@ mod tests {
         assert!(!allow_source_workspace_attach_fallback(true));
     }
 
+    #[gpui::test]
+    async fn deploy_review_companion_prefers_terminal_key_over_stale_row_identity(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project_a"),
+            json!({
+                ".git": {},
+                "a.txt": "CHANGED_A\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project_a/.git")),
+            &[("a.txt", "original_a\n".to_string())],
+        );
+
+        let project = Project::test(fs, [path!("/project_a").as_ref()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("worktree should exist")
+                .read(cx)
+                .id()
+        });
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let spawn_task = SpawnInTerminal {
+            id: TaskId("actual-terminal-key".into()),
+            full_label: "actual-terminal-key".into(),
+            label: "zed-pristine-a".into(),
+            reveal: RevealStrategy::Always,
+            reveal_target: RevealTarget::Center,
+            hide: HideStrategy::Never,
+            ..SpawnInTerminal::default()
+        };
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                TerminalPanel::add_center_terminal(workspace, window, cx, {
+                    let spawn_task = spawn_task.clone();
+                    move |project, cx| project.create_terminal_task(spawn_task, cx)
+                })
+            })
+        })
+        .await
+        .expect("terminal creation should succeed");
+        cx.run_until_parked();
+
+        let row = WorkbenchRow {
+            row_key: SharedString::from("stale-row-key"),
+            dedupe_key: SharedString::from("stale-dedupe-key"),
+            ..sample_row()
+        };
+        let project_path: ProjectPath = (worktree_id, rel_path("a.txt")).into();
+
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                deploy_review_companion_for_terminal_key(
+                    workspace,
+                    &row,
+                    project_path,
+                    "actual-terminal-key",
+                    false,
+                    window,
+                    cx,
+                );
+            })
+        });
+        cx.run_until_parked();
+
+        let (pane_count, has_review_diff) = workspace.read_with(cx, |workspace, cx| {
+            let panes = workspace.panes();
+            let has_review_diff = panes
+                .iter()
+                .find(|pane| pane_has_review_diff(pane, cx))
+                .and_then(|pane| pane.read(cx).items_of_type::<ProjectDiff>().next())
+                .is_some();
+            (panes.len(), has_review_diff)
+        });
+
+        assert_eq!(pane_count, 2, "review companion should create a right pane");
+        assert!(has_review_diff, "review diff should be present");
+    }
+
     fn sample_row() -> WorkbenchRow {
         WorkbenchRow {
             row_key: SharedString::from("row-key"),
@@ -2160,5 +2369,17 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            git_ui::init(cx);
+            terminal_view::init(cx);
+            crate::init(cx);
+        });
     }
 }
