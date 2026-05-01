@@ -19539,6 +19539,7 @@ dependencies = [
  "anyhow",
  "collections",
  "gpui",
+ "menu",
  "parking_lot",
  "task",
  "terminal_view",

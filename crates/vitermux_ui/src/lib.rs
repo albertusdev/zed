@@ -2,9 +2,11 @@ use anyhow::{Result, anyhow};
 use collections::{HashMap, HashSet};
 use gpui::{
     Action, AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Task, WeakEntity, Window, actions, px,
+    Focusable, ListAlignment, ListOffset, ListSizingBehavior, ListState, ParentElement, Pixels,
+    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity,
+    Window, actions, list, px,
 };
+use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -72,11 +74,28 @@ struct WorkbenchRow {
     attention: SharedString,
 }
 
+#[derive(Clone)]
+enum DisplayRow {
+    NodeHeader {
+        row_key: SharedString,
+        label: SharedString,
+    },
+    SessionHeader {
+        row_key: SharedString,
+        label: SharedString,
+        detail: SharedString,
+    },
+    Window(WorkbenchRow),
+}
+
 pub struct VitermuxPanel {
     workspace: WeakEntity<Workspace>,
     store: Entity<VitermuxStore>,
     focus_handle: FocusHandle,
+    list_state: ListState,
     pending_open_keys: Arc<Mutex<HashSet<String>>>,
+    rows: Vec<WorkbenchRow>,
+    display_rows: Vec<DisplayRow>,
     selected_row_key: Option<SharedString>,
     active: bool,
     width: Pixels,
@@ -96,20 +115,30 @@ impl VitermuxPanel {
 
     fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         let store = VitermuxStore::global(cx);
+        // The workbench inbox is operator-critical, so we prefer deterministic
+        // far-jump selection reveal over cheaper visible-only measurement.
+        let list_state = ListState::new(0, ListAlignment::Top, px(1000.)).measure_all();
         let mut this = Self {
             workspace,
             store: store.clone(),
             focus_handle: cx.focus_handle(),
+            list_state,
             pending_open_keys: Arc::default(),
+            rows: Vec::new(),
+            display_rows: Vec::new(),
             selected_row_key: None,
             active: false,
             width: px(336.0),
             _subscriptions: vec![cx.observe(&store, |this, _, cx| {
+                this.refresh_view_model(cx);
                 this.ensure_selection(cx);
+                this.scroll_selection_into_view();
                 cx.notify();
             })],
         };
+        this.refresh_view_model(cx);
         this.ensure_selection(cx);
+        this.scroll_selection_into_view();
         this
     }
 
@@ -117,40 +146,142 @@ impl VitermuxPanel {
         self.store.update(cx, |store, cx| store.refresh(cx));
     }
 
-    fn rows(&self, cx: &App) -> Vec<WorkbenchRow> {
-        let Some(snapshot) = self.store.read(cx).snapshot().cloned() else {
-            return Vec::new();
-        };
-        flatten_rows(&snapshot)
+    fn refresh_view_model(&mut self, cx: &mut Context<Self>) {
+        self.rows = self
+            .store
+            .read(cx)
+            .snapshot()
+            .cloned()
+            .map(|snapshot| flatten_rows(&snapshot))
+            .unwrap_or_default();
+        self.display_rows = build_display_rows(&self.rows);
+
+        if self.list_state.item_count() != self.display_rows.len() {
+            self.list_state.reset(self.display_rows.len());
+        } else {
+            self.list_state.remeasure();
+        }
     }
 
-    fn ensure_selection(&mut self, cx: &mut Context<Self>) {
-        let rows = self.rows(cx);
-        if rows.is_empty() {
+    fn ensure_selection(&mut self, _cx: &mut Context<Self>) {
+        if self.rows.is_empty() {
             self.selected_row_key = None;
             return;
         }
 
         let selected_exists = self.selected_row_key.as_ref().is_some_and(|selected| {
-            rows.iter()
+            self.rows
+                .iter()
                 .any(|row| row.row_key.as_ref() == selected.as_ref())
         });
         if !selected_exists {
-            self.selected_row_key = rows.first().map(|row| row.row_key.clone());
+            self.selected_row_key = self.rows.first().map(|row| row.row_key.clone());
         }
     }
 
-    fn selected_row(&self, cx: &App) -> Option<WorkbenchRow> {
+    fn selected_row(&self) -> Option<WorkbenchRow> {
         let selected = self.selected_row_key.as_ref()?;
-        self.rows(cx)
-            .into_iter()
+        self.rows
+            .iter()
+            .cloned()
             .find(|row| row.row_key.as_ref() == selected.as_ref())
     }
 
+    fn selected_row_index(&self) -> Option<usize> {
+        selected_row_index_in(&self.rows, self.selected_row_key.as_ref())
+    }
+
+    fn selected_display_row_index(&self) -> Option<usize> {
+        selected_display_row_index_in(&self.display_rows, self.selected_row_key.as_ref())
+    }
+
+    fn scroll_selection_into_view(&self) {
+        if let Some(index) = self.selected_display_row_index() {
+            let before = self.list_state.logical_scroll_top();
+            self.list_state.scroll_to_reveal_item(index);
+            let after = self.list_state.logical_scroll_top();
+            if index > after.item_ix
+                && after.item_ix == before.item_ix
+                && after.offset_in_item == before.offset_in_item
+            {
+                self.list_state.scroll_to(ListOffset {
+                    item_ix: index,
+                    offset_in_item: px(0.),
+                });
+            }
+        }
+    }
+
     fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(row) = self.selected_row(cx) {
+        if let Some(row) = self.selected_row() {
             self.open_row(row, window, cx);
         }
+    }
+
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_selected(window, cx);
+    }
+
+    fn select_first(&mut self, _: &SelectFirst, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(row) = self.rows.first() {
+            self.selected_row_key = Some(row.row_key.clone());
+            self.scroll_selection_into_view();
+            cx.notify();
+        }
+    }
+
+    fn select_last(&mut self, _: &SelectLast, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(row) = self.rows.last() {
+            self.selected_row_key = Some(row.row_key.clone());
+            self.scroll_selection_into_view();
+            cx.notify();
+        }
+    }
+
+    fn select_next(&mut self, _: &SelectNext, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rows.is_empty() {
+            self.selected_row_key = None;
+            cx.notify();
+            return;
+        }
+
+        let next_index = self
+            .selected_row_index()
+            .map(|selected_index| (selected_index + 1) % self.rows.len())
+            .unwrap_or(0);
+        self.selected_row_key = Some(self.rows[next_index].row_key.clone());
+        self.scroll_selection_into_view();
+
+        if !self.focus_handle.contains_focused(window, cx) {
+            cx.focus_self(window);
+        }
+        cx.notify();
+    }
+
+    fn select_previous(&mut self, _: &SelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rows.is_empty() {
+            self.selected_row_key = None;
+            cx.notify();
+            return;
+        }
+
+        let previous_index = self
+            .selected_row_index()
+            .map(|selected_index| {
+                if selected_index == 0 {
+                    self.rows.len() - 1
+                } else {
+                    selected_index - 1
+                }
+            })
+            .unwrap_or(self.rows.len() - 1);
+        self.selected_row_key = Some(self.rows[previous_index].row_key.clone());
+        self.scroll_selection_into_view();
+
+        if !self.focus_handle.contains_focused(window, cx) {
+            cx.focus_self(window);
+        }
+        cx.notify();
     }
 
     fn select_and_open(&mut self, row: WorkbenchRow, window: &mut Window, cx: &mut Context<Self>) {
@@ -318,12 +449,8 @@ impl VitermuxPanel {
             .into_any_element()
     }
 
-    fn render_rows(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let rows = self.rows(cx);
-        let selected_key = self.selected_row_key.clone();
-        let panel_focused = self.active && self.focus_handle.contains_focused(window, cx);
-
-        if rows.is_empty() {
+    fn render_rows(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.display_rows.is_empty() {
             return v_flex()
                 .p_3()
                 .child(
@@ -334,50 +461,67 @@ impl VitermuxPanel {
                 .into_any_element();
         }
 
-        let mut elements = Vec::new();
-        let mut last_node_key: Option<SharedString> = None;
-        let mut last_session_key: Option<SharedString> = None;
+        div()
+            .id("vitermux-panel-scroll")
+            .size_full()
+            .child(
+                list(
+                    self.list_state.clone(),
+                    cx.processor(|this, ix, window, cx| this.render_display_row(ix, window, cx)),
+                )
+                .with_sizing_behavior(ListSizingBehavior::Auto)
+                .size_full(),
+            )
+            .into_any_element()
+    }
 
-        for row in rows {
-            if last_node_key.as_ref() != Some(&row.node_section_key) {
-                last_node_key = Some(row.node_section_key.clone());
-                last_session_key = None;
-                elements.push(
-                    v_flex()
-                        .pt_3()
-                        .px_3()
-                        .child(
-                            Label::new(row.node_label.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Accent),
-                        )
-                        .into_any_element(),
-                );
-            }
+    fn render_display_row(
+        &self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(display_row) = self.display_rows.get(ix).cloned() else {
+            return div().into_any_element();
+        };
 
-            if last_session_key.as_ref() != Some(&row.session_section_key) {
-                last_session_key = Some(row.session_section_key.clone());
-                elements.push(
-                    v_flex()
-                        .px_3()
-                        .pt_1()
-                        .pb_1()
-                        .gap_0p5()
-                        .child(Label::new(row.session_label.clone()).size(LabelSize::Small))
-                        .child(
-                            Label::new(row.session_detail.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .into_any_element(),
-                );
-            }
+        match display_row {
+            DisplayRow::NodeHeader { row_key, label } => v_flex()
+                .id(row_key)
+                .pt_3()
+                .px_3()
+                .child(
+                    Label::new(label)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Accent),
+                )
+                .into_any_element(),
+            DisplayRow::SessionHeader {
+                row_key,
+                label,
+                detail,
+            } => v_flex()
+                .id(row_key)
+                .px_3()
+                .pt_1()
+                .pb_1()
+                .gap_0p5()
+                .child(Label::new(label).size(LabelSize::Small))
+                .when(!detail.is_empty(), |this| {
+                    this.child(
+                        Label::new(detail)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                })
+                .into_any_element(),
+            DisplayRow::Window(row) => {
+                let row_key = row.row_key.clone();
+                let row_clone = row.clone();
+                let row_selected = self.selected_row_key.as_ref() == Some(&row.row_key);
+                let disabled = row.session_key.is_none();
+                let panel_focused = self.active && self.focus_handle.contains_focused(window, cx);
 
-            let row_key = row.row_key.clone();
-            let row_clone = row.clone();
-            let row_selected = selected_key.as_ref() == Some(&row.row_key);
-            let disabled = row.session_key.is_none();
-            elements.push(
                 ListItem::new(row.row_key.clone())
                     .toggle_state(row_selected)
                     .focused(panel_focused && row_selected)
@@ -410,11 +554,9 @@ impl VitermuxPanel {
                                     .color(Color::Muted),
                             ),
                     )
-                    .into_any_element(),
-            );
+                    .into_any_element()
+            }
         }
-
-        v_flex().w_full().children(elements).into_any_element()
     }
 }
 
@@ -429,7 +571,7 @@ impl Focusable for VitermuxPanel {
 impl Render for VitermuxPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
-            .key_context("VitermuxPanel")
+            .key_context("VitermuxPanel menu")
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .border_r_1()
@@ -438,15 +580,14 @@ impl Render for VitermuxPanel {
             } else {
                 cx.theme().colors().border_variant
             })
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::select_first))
+            .on_action(cx.listener(Self::select_last))
+            .on_action(cx.listener(Self::confirm))
             .track_focus(&self.focus_handle)
             .child(self.render_header(window, cx))
-            .child(
-                v_flex()
-                    .id("vitermux-panel-scroll")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .child(self.render_rows(window, cx)),
-            )
+            .child(self.render_rows(window, cx))
     }
 }
 
@@ -565,6 +706,40 @@ fn flatten_rows(snapshot: &TmuxTreeSnapshot) -> Vec<WorkbenchRow> {
     }
 
     rows
+}
+
+fn build_display_rows(rows: &[WorkbenchRow]) -> Vec<DisplayRow> {
+    let mut display_rows = Vec::new();
+    let mut last_node_key: Option<&str> = None;
+    let mut last_session_key: Option<&str> = None;
+
+    for row in rows {
+        if last_node_key != Some(row.node_section_key.as_ref()) {
+            last_node_key = Some(row.node_section_key.as_ref());
+            last_session_key = None;
+            display_rows.push(DisplayRow::NodeHeader {
+                row_key: SharedString::from(format!("node:{}", row.node_section_key.as_ref())),
+                label: row.node_label.clone(),
+            });
+        }
+
+        if last_session_key != Some(row.session_section_key.as_ref()) {
+            last_session_key = Some(row.session_section_key.as_ref());
+            display_rows.push(DisplayRow::SessionHeader {
+                row_key: SharedString::from(format!(
+                    "session:{}:{}",
+                    row.node_section_key.as_ref(),
+                    row.session_section_key.as_ref()
+                )),
+                label: row.session_label.clone(),
+                detail: row.session_detail.clone(),
+            });
+        }
+
+        display_rows.push(DisplayRow::Window(row.clone()));
+    }
+
+    display_rows
 }
 
 fn build_spawn_task(row: &WorkbenchRow, plan: &ZedOpenPlan) -> Result<SpawnInTerminal> {
@@ -809,6 +984,23 @@ fn first_non_empty<'a>(values: impl IntoIterator<Item = &'a str>) -> &'a str {
         .unwrap_or("")
 }
 
+fn selected_row_index_in(rows: &[WorkbenchRow], selected: Option<&SharedString>) -> Option<usize> {
+    let selected = selected?;
+    rows.iter()
+        .position(|row| row.row_key.as_ref() == selected.as_ref())
+}
+
+fn selected_display_row_index_in(
+    display_rows: &[DisplayRow],
+    selected: Option<&SharedString>,
+) -> Option<usize> {
+    let selected = selected?;
+    display_rows.iter().position(|row| match row {
+        DisplayRow::Window(row) => row.row_key.as_ref() == selected.as_ref(),
+        DisplayRow::NodeHeader { .. } | DisplayRow::SessionHeader { .. } => false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,6 +1059,106 @@ mod tests {
         );
         assert_eq!(row.node_label.as_ref(), "poros (Albertus)");
         assert_eq!(row.window_label.as_ref(), "frontend-logging-cleanup");
+    }
+
+    #[test]
+    fn selected_row_index_matches_row_key() {
+        let rows = vec![
+            WorkbenchRow {
+                row_key: SharedString::from("row-1"),
+                ..sample_row()
+            },
+            WorkbenchRow {
+                row_key: SharedString::from("row-2"),
+                ..sample_row()
+            },
+        ];
+
+        assert_eq!(
+            selected_row_index_in(&rows, Some(&SharedString::from("row-2"))),
+            Some(1)
+        );
+        assert_eq!(
+            selected_row_index_in(&rows, Some(&SharedString::from("missing"))),
+            None
+        );
+    }
+
+    #[test]
+    fn build_display_rows_inserts_group_headers_once_per_section() {
+        let rows = vec![
+            WorkbenchRow {
+                row_key: SharedString::from("row-1"),
+                session_section_key: SharedString::from("main"),
+                window_label: SharedString::from("frontend-logging-cleanup"),
+                ..sample_row()
+            },
+            WorkbenchRow {
+                row_key: SharedString::from("row-2"),
+                session_section_key: SharedString::from("main"),
+                window_label: SharedString::from("library-ux-rewrite"),
+                ..sample_row()
+            },
+            WorkbenchRow {
+                row_key: SharedString::from("row-3"),
+                session_section_key: SharedString::from("review"),
+                session_label: SharedString::from("review"),
+                ..sample_row()
+            },
+        ];
+
+        let display_rows = build_display_rows(&rows);
+        assert_eq!(display_rows.len(), 6);
+        assert!(matches!(
+            &display_rows[0],
+            DisplayRow::NodeHeader { label, .. } if label.as_ref() == "poros"
+        ));
+        assert!(matches!(
+            &display_rows[1],
+            DisplayRow::SessionHeader { label, .. } if label.as_ref() == "main"
+        ));
+        assert!(
+            matches!(&display_rows[2], DisplayRow::Window(row) if row.row_key.as_ref() == "row-1")
+        );
+        assert!(
+            matches!(&display_rows[3], DisplayRow::Window(row) if row.row_key.as_ref() == "row-2")
+        );
+        assert!(matches!(
+            &display_rows[4],
+            DisplayRow::SessionHeader { label, .. } if label.as_ref() == "review"
+        ));
+        assert!(
+            matches!(&display_rows[5], DisplayRow::Window(row) if row.row_key.as_ref() == "row-3")
+        );
+    }
+
+    #[test]
+    fn selected_display_row_index_matches_visible_window_row() {
+        let display_rows = build_display_rows(&[
+            WorkbenchRow {
+                row_key: SharedString::from("row-1"),
+                ..sample_row()
+            },
+            WorkbenchRow {
+                row_key: SharedString::from("row-2"),
+                session_section_key: SharedString::from("review"),
+                session_label: SharedString::from("review"),
+                ..sample_row()
+            },
+        ]);
+
+        assert_eq!(
+            selected_display_row_index_in(&display_rows, Some(&SharedString::from("row-1"))),
+            Some(2)
+        );
+        assert_eq!(
+            selected_display_row_index_in(&display_rows, Some(&SharedString::from("row-2"))),
+            Some(4)
+        );
+        assert_eq!(
+            selected_display_row_index_in(&display_rows, Some(&SharedString::from("missing"))),
+            None
+        );
     }
 
     #[test]

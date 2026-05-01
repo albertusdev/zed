@@ -12,6 +12,7 @@ workspace = true
 anyhow.workspace = true
 collections.workspace = true
 gpui.workspace = true
+menu.workspace = true
 parking_lot.workspace = true
 task.workspace = true
 terminal_view.workspace = true
