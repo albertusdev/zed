@@ -210,14 +210,13 @@ impl VitermuxPanel {
             .clone()
             .ok_or_else(|| anyhow!("missing vitermux session key"))
             .map(|id| id.to_string());
-        let terminal_panel = workspace.as_ref().ok().and_then(|workspace| {
-            workspace.read_with(cx, |workspace, cx| workspace.panel::<TerminalPanel>(cx))
-        });
 
         window.spawn(cx, async move |cx| {
             let result = async {
                 let workspace = workspace?;
                 let session_key = session_key?;
+                let terminal_panel =
+                    workspace.read_with(cx, |workspace, cx| workspace.panel::<TerminalPanel>(cx));
 
                 let did_focus_existing = workspace.update_in(cx, |workspace, window, cx| {
                     focus_existing_terminal(
@@ -234,6 +233,8 @@ impl VitermuxPanel {
 
                 let plan = client.fetch_open_plan(&session_key).await?;
                 let spawn_task = build_spawn_task(&row, &plan)?;
+                let terminal_panel =
+                    workspace.read_with(cx, |workspace, cx| workspace.panel::<TerminalPanel>(cx));
                 let did_focus_existing = workspace.update_in(cx, |workspace, window, cx| {
                     focus_existing_terminal(
                         workspace,
@@ -688,19 +689,22 @@ fn focus_existing_terminal(
     }
 
     let target = panes.iter().find_map(|pane| {
-        pane.read(cx).items().find_map(|item| {
+        pane.read(cx).items().enumerate().find_map(|(ix, item)| {
             let terminal_view = item.act_as::<TerminalView>(cx)?;
             let task = terminal_view.read(cx).terminal().read(cx).task()?;
             if task.spawned_task.full_label == full_label {
-                Some(terminal_view)
+                Some((pane.clone(), ix))
             } else {
                 None
             }
         })
     });
 
-    if let Some(terminal_view) = target {
-        return workspace.activate_item(&terminal_view, true, true, window, cx);
+    if let Some((pane, ix)) = target {
+        pane.update(cx, |pane, cx| {
+            pane.activate_item(ix, true, true, window, cx)
+        });
+        return true;
     }
 
     false
