@@ -4,10 +4,11 @@ use gpui::{
     Action, AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
     Focusable, ListAlignment, ListOffset, ListSizingBehavior, ListState, ParentElement, Pixels,
     Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity,
-    Window, actions, list, px,
+    Window, WindowHandle, actions, list, px,
 };
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use parking_lot::Mutex;
+use remote::{RemoteConnectionOptions, SshConnectionOptions, same_remote_connection_identity};
 use std::path::PathBuf;
 use std::sync::Arc;
 use task::{
@@ -23,7 +24,7 @@ use vitermux::{
     ZedOpenPlan,
 };
 use workspace::{
-    Toast, Workspace,
+    MultiWorkspace, OpenMode, PathList, Toast, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
     notifications::{DetachAndPromptErr, NotificationId},
 };
@@ -336,6 +337,7 @@ impl VitermuxPanel {
             return Task::ready(Ok(()));
         }
         let pending_open_keys = self.pending_open_keys.clone();
+        let requesting_window = window.window_handle().downcast::<MultiWorkspace>();
         let session_key = row
             .session_key
             .clone()
@@ -363,6 +365,14 @@ impl VitermuxPanel {
                 }
 
                 let plan = client.fetch_open_plan(&session_key).await?;
+                let workspace = ensure_project_workspace_for_plan(
+                    workspace.clone(),
+                    requesting_window.clone(),
+                    &plan,
+                    cx,
+                )
+                .await
+                .unwrap_or(workspace);
                 let spawn_task = build_spawn_task(&row, &plan)?;
                 let terminal_panel =
                     workspace.read_with(cx, |workspace, cx| workspace.panel::<TerminalPanel>(cx));
@@ -740,6 +750,111 @@ fn build_display_rows(rows: &[WorkbenchRow]) -> Vec<DisplayRow> {
     }
 
     display_rows
+}
+
+async fn ensure_project_workspace_for_plan(
+    source_workspace: Entity<Workspace>,
+    requesting_window: Option<WindowHandle<MultiWorkspace>>,
+    plan: &ZedOpenPlan,
+    cx: &mut AsyncWindowContext,
+) -> Result<Entity<Workspace>> {
+    let Some(requesting_window) = requesting_window else {
+        return Ok(source_workspace);
+    };
+    let Some(target_path) = project_target_path(plan) else {
+        return Ok(source_workspace);
+    };
+
+    let connection_options = project_connection_options(plan)?;
+    let target_paths = vec![target_path];
+
+    if let Some(existing_workspace) =
+        requesting_window.update(cx, |multi_workspace, window, cx| {
+            let existing_workspace = find_matching_workspace_in_window(
+                multi_workspace,
+                &target_paths,
+                connection_options.as_ref(),
+                cx,
+            );
+            if let Some(workspace) = existing_workspace.as_ref() {
+                multi_workspace.activate(workspace.clone(), None, window, cx);
+            }
+            existing_workspace
+        })?
+    {
+        return Ok(existing_workspace);
+    }
+
+    let modal_workspace = source_workspace.clone();
+    let open_task = requesting_window.update(cx, |multi_workspace, window, cx| {
+        multi_workspace.find_or_create_workspace(
+            PathList::new(&target_paths),
+            connection_options.clone(),
+            None,
+            move |connection_options, window, cx| {
+                remote_connection::connect_with_modal(
+                    &modal_workspace,
+                    connection_options,
+                    window,
+                    cx,
+                )
+            },
+            &[],
+            None,
+            OpenMode::Activate,
+            window,
+            cx,
+        )
+    })?;
+
+    open_task.await
+}
+
+fn find_matching_workspace_in_window(
+    multi_workspace: &MultiWorkspace,
+    target_paths: &[PathBuf],
+    connection_options: Option<&RemoteConnectionOptions>,
+    cx: &App,
+) -> Option<Entity<Workspace>> {
+    let mut best_match = None;
+    let mut matching_workspace = None;
+
+    for workspace in multi_workspace.workspaces() {
+        let project = workspace.read(cx).project().clone();
+        if !same_remote_connection_identity(
+            project.read(cx).remote_connection_options(cx).as_ref(),
+            connection_options,
+        ) {
+            continue;
+        }
+
+        let visibility = project
+            .read(cx)
+            .visibility_for_paths(target_paths, false, cx);
+        if visibility > best_match {
+            best_match = visibility;
+            matching_workspace = Some(workspace.clone());
+        }
+    }
+
+    matching_workspace
+}
+
+fn project_connection_options(plan: &ZedOpenPlan) -> Result<Option<RemoteConnectionOptions>> {
+    if plan.project.mode != "remote" {
+        return Ok(None);
+    }
+
+    let ssh_address = non_empty_string(plan.project.ssh_address.as_str())
+        .ok_or_else(|| anyhow!("daemon open plan did not include an ssh address"))?;
+    let ssh_options = SshConnectionOptions::parse_command_line(&ssh_address)?;
+    Ok(Some(RemoteConnectionOptions::from(ssh_options)))
+}
+
+fn project_target_path(plan: &ZedOpenPlan) -> Option<PathBuf> {
+    non_empty_string(plan.project.remote_path.as_str())
+        .or_else(|| non_empty_string(plan.attach.cwd.as_str()))
+        .map(PathBuf::from)
 }
 
 fn build_spawn_task(row: &WorkbenchRow, plan: &ZedOpenPlan) -> Result<SpawnInTerminal> {

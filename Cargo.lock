@@ -19541,6 +19541,8 @@ dependencies = [
  "gpui",
  "menu",
  "parking_lot",
+ "remote",
+ "remote_connection",
  "task",
  "terminal_view",
  "ui",
