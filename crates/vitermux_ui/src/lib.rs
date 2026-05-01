@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use collections::{HashMap, HashSet};
+use git_ui::project_diff::ProjectDiff;
 use gpui::{
     Action, AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
     Focusable, ListAlignment, ListOffset, ListSizingBehavior, ListState, ParentElement, Pixels,
@@ -9,15 +10,15 @@ use gpui::{
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use parking_lot::Mutex;
 use remote::{RemoteConnectionOptions, SshConnectionOptions, same_remote_connection_identity};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use task::{
     HideStrategy, RevealStrategy, RevealTarget, SaveStrategy, Shell, SpawnInTerminal, TaskId,
 };
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use ui::{
-    Color, Disableable, Icon, IconName, Label, LabelSize, ListItem, ListItemSpacing, Toggleable,
-    Tooltip, prelude::*,
+    Color, Disableable, Icon, IconButton, IconName, IconSize, Label, LabelSize, ListItem,
+    ListItemSpacing, Toggleable, Tooltip, prelude::*,
 };
 use vitermux::{
     OpenPlanFailure, TmuxTreeSnapshot, TmuxWindow, VitermuxConnectionState, VitermuxStore,
@@ -33,7 +34,13 @@ const VITERMUX_PANEL_KEY: &str = "VitermuxPanel";
 
 actions!(
     vitermux_panel,
-    [Toggle, ToggleFocus, Refresh, OpenSelected,]
+    [
+        Toggle,
+        ToggleFocus,
+        Refresh,
+        OpenSelected,
+        OpenReviewSelected,
+    ]
 );
 
 pub fn init(cx: &mut App) {
@@ -54,6 +61,11 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &OpenSelected, window, cx| {
             if let Some(panel) = workspace.panel::<VitermuxPanel>(cx) {
                 panel.update(cx, |panel, cx| panel.open_selected(window, cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &OpenReviewSelected, window, cx| {
+            if let Some(panel) = workspace.panel::<VitermuxPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.open_selected_review(window, cx));
             }
         });
     })
@@ -219,6 +231,12 @@ impl VitermuxPanel {
         }
     }
 
+    fn open_selected_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(row) = self.selected_row() {
+            self.open_review_for_row(row, window, cx);
+        }
+    }
+
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
         self.open_selected(window, cx);
     }
@@ -317,6 +335,20 @@ impl VitermuxPanel {
         );
     }
 
+    fn open_review_for_row(
+        &mut self,
+        row: WorkbenchRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if row.session_key.is_none() {
+            return;
+        }
+
+        self.fetch_and_open_review(row, window, cx)
+            .detach_and_prompt_err("Vitermux Review Open Failed", window, cx, |_, _, _| None);
+    }
+
     fn fetch_and_open(
         &self,
         row: WorkbenchRow,
@@ -373,7 +405,9 @@ impl VitermuxPanel {
                 )
                 .await
                 .unwrap_or(workspace);
-                let spawn_task = build_spawn_task(&row, &plan)?;
+                let workspace_is_remote =
+                    workspace.read_with(cx, |workspace, cx| workspace.project().read(cx).is_remote());
+                let spawn_task = build_spawn_task(&row, &plan, workspace_is_remote)?;
                 let terminal_panel =
                     workspace.read_with(cx, |workspace, cx| workspace.panel::<TerminalPanel>(cx));
                 let did_focus_existing = workspace.update_in(cx, |workspace, window, cx| {
@@ -402,6 +436,43 @@ impl VitermuxPanel {
 
             pending_open_keys.lock().remove(&open_key);
             result
+        })
+    }
+
+    fn fetch_and_open_review(
+        &self,
+        row: WorkbenchRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let client = self.store.read(cx).client();
+        let workspace = self
+            .workspace
+            .upgrade()
+            .ok_or_else(|| anyhow!("workspace is no longer available"));
+        let requesting_window = window.window_handle().downcast::<MultiWorkspace>();
+        let session_key = row
+            .session_key
+            .clone()
+            .ok_or_else(|| anyhow!("missing vitermux session key"))
+            .map(|id| id.to_string());
+
+        window.spawn(cx, async move |cx| {
+            let workspace = workspace?;
+            let session_key = session_key?;
+            let plan = client.fetch_open_plan(&session_key).await?;
+            if project_target_path(&plan).is_none() {
+                return Err(anyhow!(
+                    "daemon open plan did not include a project path for review"
+                ));
+            }
+
+            let workspace =
+                ensure_project_workspace_for_plan(workspace, requesting_window, &plan, cx).await?;
+            workspace.update_in(cx, |workspace, window, cx| {
+                ProjectDiff::deploy_at(workspace, None, window, cx);
+            })?;
+            Ok(())
         })
     }
 
@@ -528,9 +599,11 @@ impl VitermuxPanel {
             DisplayRow::Window(row) => {
                 let row_key = row.row_key.clone();
                 let row_clone = row.clone();
+                let review_row = row.clone();
                 let row_selected = self.selected_row_key.as_ref() == Some(&row.row_key);
                 let disabled = row.session_key.is_none();
                 let panel_focused = self.active && self.focus_handle.contains_focused(window, cx);
+                let show_review = review_available(&row);
 
                 ListItem::new(row.row_key.clone())
                     .toggle_state(row_selected)
@@ -542,7 +615,29 @@ impl VitermuxPanel {
                         Icon::new(attention_icon(row.attention.as_ref()))
                             .color(attention_color(row.attention.as_ref())),
                     )
-                    .end_slot(Icon::new(IconName::ChevronRight).color(Color::Muted))
+                    .end_slot(
+                        h_flex()
+                            .gap_1()
+                            .when(show_review, |this| {
+                                this.child(
+                                    IconButton::new(
+                                        format!("review:{}", row_key.as_ref()),
+                                        IconName::Diff,
+                                    )
+                                        .icon_size(IconSize::Small)
+                                        .icon_color(Color::Muted)
+                                        .tooltip(Tooltip::text("Open review diff"))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_review_for_row(
+                                                review_row.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                            })
+                            .child(Icon::new(IconName::ChevronRight).color(Color::Muted)),
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.select_and_open(row_clone.clone(), window, cx);
                     }))
@@ -816,10 +911,22 @@ fn find_matching_workspace_in_window(
     connection_options: Option<&RemoteConnectionOptions>,
     cx: &App,
 ) -> Option<Entity<Workspace>> {
+    let target_path_list = PathList::new(target_paths);
     let mut best_match = None;
     let mut matching_workspace = None;
 
     for workspace in multi_workspace.workspaces() {
+        let root_paths = workspace.read(cx).root_paths(cx);
+        if PathList::new(&root_paths) == target_path_list {
+            let project = workspace.read(cx).project().clone();
+            if same_remote_connection_identity(
+                project.read(cx).remote_connection_options(cx).as_ref(),
+                connection_options,
+            ) {
+                return Some(workspace.clone());
+            }
+        }
+
         let project = workspace.read(cx).project().clone();
         if !same_remote_connection_identity(
             project.read(cx).remote_connection_options(cx).as_ref(),
@@ -831,13 +938,24 @@ fn find_matching_workspace_in_window(
         let visibility = project
             .read(cx)
             .visibility_for_paths(target_paths, false, cx);
-        if visibility > best_match {
-            best_match = visibility;
+        let match_depth = matching_root_depth(&root_paths, target_paths);
+        let score = visibility.map(|visible| (visible, match_depth));
+        if score > best_match {
+            best_match = score;
             matching_workspace = Some(workspace.clone());
         }
     }
 
     matching_workspace
+}
+
+fn matching_root_depth(root_paths: &[Arc<Path>], target_paths: &[PathBuf]) -> usize {
+    root_paths
+        .iter()
+        .filter(|root| target_paths.iter().all(|path| path.starts_with(root.as_ref())))
+        .map(|root| root.components().count())
+        .max()
+        .unwrap_or(0)
 }
 
 fn project_connection_options(plan: &ZedOpenPlan) -> Result<Option<RemoteConnectionOptions>> {
@@ -857,14 +975,18 @@ fn project_target_path(plan: &ZedOpenPlan) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn build_spawn_task(row: &WorkbenchRow, plan: &ZedOpenPlan) -> Result<SpawnInTerminal> {
+fn build_spawn_task(
+    row: &WorkbenchRow,
+    plan: &ZedOpenPlan,
+    workspace_is_remote: bool,
+) -> Result<SpawnInTerminal> {
     if let Some(failure) = plan.failure.as_ref() {
         return Err(open_plan_failure(failure));
     }
 
-    let (command, args) = resolve_attach_command(plan)?;
+    let (command, args) = resolve_attach_command(plan, workspace_is_remote)?;
     let (shell, command, args) = spawn_command_parts(plan, command, args);
-    let cwd = spawn_cwd(plan);
+    let cwd = spawn_cwd(plan, workspace_is_remote);
     let dedupe_key = if !plan.attach.dedupe_key.trim().is_empty() {
         plan.attach.dedupe_key.clone()
     } else if !row.dedupe_key.trim().is_empty() {
@@ -907,7 +1029,15 @@ fn open_plan_failure(failure: &OpenPlanFailure) -> anyhow::Error {
     anyhow!(failure.display_message())
 }
 
-fn resolve_attach_command(plan: &ZedOpenPlan) -> Result<(String, Vec<String>)> {
+fn resolve_attach_command(
+    plan: &ZedOpenPlan,
+    workspace_is_remote: bool,
+) -> Result<(String, Vec<String>)> {
+    if workspace_is_remote && plan.attach.mode == "ssh_shell" {
+        return tmux_attach_fallback(plan)
+            .ok_or_else(|| anyhow!("daemon remote attach plan did not include a tmux target"));
+    }
+
     if plan.attach.mode == "ssh_shell" {
         return argv_attach_command(plan)
             .ok_or_else(|| anyhow!("daemon SSH attach plan did not include argv"));
@@ -918,7 +1048,7 @@ fn resolve_attach_command(plan: &ZedOpenPlan) -> Result<(String, Vec<String>)> {
     }
 
     if plan.attach.mode == "local_shell" {
-        if let Some((command, args)) = local_shell_fallback(plan) {
+        if let Some((command, args)) = tmux_attach_fallback(plan) {
             return Ok((command, args));
         }
     }
@@ -941,7 +1071,7 @@ fn argv_attach_command(plan: &ZedOpenPlan) -> Option<(String, Vec<String>)> {
     Some((command.to_string(), argv.cloned().collect()))
 }
 
-fn local_shell_fallback(plan: &ZedOpenPlan) -> Option<(String, Vec<String>)> {
+fn tmux_attach_fallback(plan: &ZedOpenPlan) -> Option<(String, Vec<String>)> {
     let tmux_session = non_empty_string(plan.target_ref.tmux_session.as_str())?;
     let cwd = non_empty_string(plan.project.remote_path.as_str())
         .or_else(|| non_empty_string(plan.attach.cwd.as_str()))?;
@@ -1022,6 +1152,10 @@ fn window_detail(window: &TmuxWindow) -> String {
     ])
 }
 
+fn review_available(row: &WorkbenchRow) -> bool {
+    row.session_key.is_some() && row.attention.as_ref() == "new_review"
+}
+
 fn join_detail_parts(parts: impl IntoIterator<Item = Option<String>>) -> String {
     parts
         .into_iter()
@@ -1075,8 +1209,8 @@ fn spawn_command_parts(
     (Shell::System, Some(command), args)
 }
 
-fn spawn_cwd(plan: &ZedOpenPlan) -> Option<PathBuf> {
-    if plan.project.mode == "remote" {
+fn spawn_cwd(plan: &ZedOpenPlan, workspace_is_remote: bool) -> Option<PathBuf> {
+    if workspace_is_remote || plan.project.mode == "remote" {
         return None;
     }
 
@@ -1300,7 +1434,7 @@ mod tests {
             ..sample_plan()
         };
 
-        let task = build_spawn_task(&row, &plan).expect("remote argv attach should build");
+        let task = build_spawn_task(&row, &plan, false).expect("remote argv attach should build");
         assert_eq!(
             task.id,
             TaskId("node:poros/acct:albertus@poros/sess:main/win:2".into())
@@ -1338,7 +1472,8 @@ mod tests {
             ..sample_plan()
         };
 
-        let error = build_spawn_task(&row, &plan).expect_err("remote attach should require argv");
+        let error =
+            build_spawn_task(&row, &plan, false).expect_err("remote attach should require argv");
         assert!(
             error
                 .to_string()
@@ -1369,7 +1504,7 @@ mod tests {
             ..sample_plan()
         };
 
-        let task = build_spawn_task(&row, &plan).expect("local fallback should build");
+        let task = build_spawn_task(&row, &plan, false).expect("local fallback should build");
         assert_eq!(
             task.cwd,
             Some(PathBuf::from("/tmp/frontend-logging-cleanup"))
@@ -1382,6 +1517,52 @@ mod tests {
                 args: vec![
                     "-lc".into(),
                     "if tmux has-session -t 'main' 2>/dev/null; then exec tmux attach-session -t 'main' \\; select-window -t 'main:2'; else cd -- '/tmp/frontend-logging-cleanup' && exec ${SHELL:-zsh} -l; fi".into(),
+                ],
+                title_override: None,
+            }
+        );
+    }
+
+    #[test]
+    fn build_spawn_task_uses_remote_tmux_attach_inside_remote_workspace() {
+        let row = sample_row();
+        let plan = ZedOpenPlan {
+            project: vitermux::ZedProjectTarget {
+                mode: "remote".into(),
+                remote_path: "/home/albertus/dev/agent-hud".into(),
+                ..Default::default()
+            },
+            attach: vitermux::ZedAttachSpec {
+                mode: "ssh_shell".into(),
+                argv: vec![
+                    "ssh".into(),
+                    "-t".into(),
+                    "albertus@poros".into(),
+                    "tmux attach-session -t main \\; select-window -t main:2".into(),
+                ],
+                cwd: "/home/albertus/dev/agent-hud".into(),
+                dedupe_key: "node:poros/acct:albertus@poros/sess:main/win:2".into(),
+                ..Default::default()
+            },
+            target_ref: vitermux::TargetRef {
+                tmux_session: "main".into(),
+                tmux_window: "2".into(),
+                ..Default::default()
+            },
+            ..sample_plan()
+        };
+
+        let task =
+            build_spawn_task(&row, &plan, true).expect("remote workspace attach should build");
+        assert_eq!(task.cwd, None);
+        assert_eq!(task.command, None);
+        assert_eq!(
+            task.shell,
+            Shell::WithArguments {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-lc".into(),
+                    "if tmux has-session -t 'main' 2>/dev/null; then exec tmux attach-session -t 'main' \\; select-window -t 'main:2'; else cd -- '/home/albertus/dev/agent-hud' && exec ${SHELL:-zsh} -l; fi".into(),
                 ],
                 title_override: None,
             }

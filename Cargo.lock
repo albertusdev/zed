@@ -19538,6 +19538,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collections",
+ "git_ui",
  "gpui",
  "menu",
  "parking_lot",

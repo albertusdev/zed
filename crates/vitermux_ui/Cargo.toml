@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 collections.workspace = true
+git_ui.workspace = true
 gpui.workspace = true
 menu.workspace = true
 parking_lot.workspace = true
