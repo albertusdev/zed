@@ -866,6 +866,12 @@ impl TerminalView {
         let mut dispatch_context = KeyContext::new_with_defaults();
         dispatch_context.add("Terminal");
 
+        if self.terminal.read(cx).task().is_some_and(|task| {
+            task.spawned_task.full_label.starts_with("vitermux:")
+        }) {
+            dispatch_context.add("vitermux_terminal");
+        }
+
         if self.terminal.read(cx).vi_mode_enabled() {
             dispatch_context.add("vi_mode");
         }

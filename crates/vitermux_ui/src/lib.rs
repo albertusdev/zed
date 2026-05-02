@@ -2789,7 +2789,7 @@ mod tests {
                 KeymapFile::load_panic_on_failure(
                     r#"[
                         {
-                            "context": "Workspace && left_dock == VitermuxPanel",
+                            "context": "VitermuxPanel || (Terminal && vitermux_terminal)",
                             "bindings": {
                                 "cmd-2": ["vitermux_panel::ActivateSlot", 1]
                             }
@@ -2810,7 +2810,7 @@ mod tests {
             let binding = window
                 .highest_precedence_binding_for_action_in_context(
                     &ActivateSlot(1),
-                    KeyContext::parse("Workspace left_dock=VitermuxPanel")
+                    KeyContext::parse("Terminal vitermux_terminal")
                         .expect("key context should parse"),
                 )
                 .expect("activate slot binding should exist");
@@ -2818,6 +2818,18 @@ mod tests {
         })
         .expect("window update should succeed");
         assert_eq!(activate_slot_matches, Some(false));
+
+        let activate_slot_from_panel_matches = window.update(cx, |_workspace, window, _cx| {
+            let binding = window
+                .highest_precedence_binding_for_action_in_context(
+                    &ActivateSlot(1),
+                    KeyContext::parse("VitermuxPanel").expect("key context should parse"),
+                )
+                .expect("activate slot binding should exist");
+            binding.match_keystrokes(&[Keystroke::parse("cmd-2").unwrap()])
+        })
+        .expect("window update should succeed");
+        assert_eq!(activate_slot_from_panel_matches, Some(false));
 
         let assign_slot_matches = window.update(cx, |_workspace, window, _cx| {
             let binding = window

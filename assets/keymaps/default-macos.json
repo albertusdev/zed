@@ -54,7 +54,7 @@
     },
   },
   {
-    "context": "Workspace && left_dock == VitermuxPanel",
+    "context": "VitermuxPanel || (Terminal && vitermux_terminal)",
     "bindings": {
       "cmd-1": ["vitermux_panel::ActivateSlot", 0],
       "cmd-2": ["vitermux_panel::ActivateSlot", 1],
