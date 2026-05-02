@@ -232,6 +232,12 @@ async fn build_remote_server_from_source(
         Ok(())
     }
 
+    let shell_path = login_shell_path_env().await;
+    let command_path = merged_path_env(shell_path.as_deref());
+    let cargo = which("cargo", command_path.as_deref(), cx)
+        .await?
+        .context("cargo not found on $PATH, install rustup (see https://rustup.rs/)")?;
+
     let use_musl = !build_remote_server.contains("nomusl");
     let triple = format!(
         "{}-{}",
@@ -268,25 +274,25 @@ async fn build_remote_server_from_source(
     {
         delegate.set_status(Some("Building remote server binary from source"), cx);
         log::info!("building remote server binary from source");
-        run_cmd(
-            new_command("cargo")
-                .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
-                .args([
-                    "build",
-                    "--package",
-                    "remote_server",
-                    "--features",
-                    "debug-embed",
-                    "--target-dir",
-                    "target/remote_server",
-                    "--target",
-                    &triple,
-                ])
-                .env("RUSTFLAGS", &rust_flags),
-        )
-        .await?;
+        let mut command = new_command(&cargo);
+        command
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+            .args([
+                "build",
+                "--package",
+                "remote_server",
+                "--features",
+                "debug-embed",
+                "--target-dir",
+                "target/remote_server",
+                "--target",
+                &triple,
+            ])
+            .env("RUSTFLAGS", &rust_flags);
+        apply_path_env(&mut command, command_path.as_deref());
+        run_cmd(&mut command).await?;
     } else {
-        if which("zig", cx).await?.is_none() {
+        if which("zig", command_path.as_deref(), cx).await?.is_none() {
             anyhow::bail!(if cfg!(not(windows)) {
                 "zig not found on $PATH, install zig (see https://ziglang.org/learn/getting-started or use zigup)"
             } else {
@@ -294,17 +300,26 @@ async fn build_remote_server_from_source(
             });
         }
 
-        let rustup = which("rustup", cx)
+        let rustup = which("rustup", command_path.as_deref(), cx)
             .await?
             .context("rustup not found on $PATH, install rustup (see https://rustup.rs/)")?;
         delegate.set_status(Some("Adding rustup target for cross-compilation"), cx);
         log::info!("adding rustup target");
-        run_cmd(new_command(rustup).args(["target", "add"]).arg(&triple)).await?;
+        let mut rustup_cmd = new_command(rustup);
+        rustup_cmd.args(["target", "add"]).arg(&triple);
+        apply_path_env(&mut rustup_cmd, command_path.as_deref());
+        run_cmd(&mut rustup_cmd).await?;
 
-        if which("cargo-zigbuild", cx).await?.is_none() {
+        if which("cargo-zigbuild", command_path.as_deref(), cx)
+            .await?
+            .is_none()
+        {
             delegate.set_status(Some("Installing cargo-zigbuild for cross-compilation"), cx);
             log::info!("installing cargo-zigbuild");
-            run_cmd(new_command("cargo").args(["install", "--locked", "cargo-zigbuild"])).await?;
+            let mut install_cmd = new_command(&cargo);
+            install_cmd.args(["install", "--locked", "cargo-zigbuild"]);
+            apply_path_env(&mut install_cmd, command_path.as_deref());
+            run_cmd(&mut install_cmd).await?;
         }
 
         delegate.set_status(
@@ -314,23 +329,23 @@ async fn build_remote_server_from_source(
             cx,
         );
         log::info!("building remote binary from source for {triple} with Zig");
-        run_cmd(
-            new_command("cargo")
-                .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
-                .args([
-                    "zigbuild",
-                    "--package",
-                    "remote_server",
-                    "--features",
-                    "debug-embed",
-                    "--target-dir",
-                    "target/remote_server",
-                    "--target",
-                    &triple,
-                ])
-                .env("RUSTFLAGS", &rust_flags),
-        )
-        .await?;
+        let mut zigbuild_cmd = new_command(&cargo);
+        zigbuild_cmd
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+            .args([
+                "zigbuild",
+                "--package",
+                "remote_server",
+                "--features",
+                "debug-embed",
+                "--target-dir",
+                "target/remote_server",
+                "--target",
+                &triple,
+            ])
+            .env("RUSTFLAGS", &rust_flags);
+        apply_path_env(&mut zigbuild_cmd, command_path.as_deref());
+        run_cmd(&mut zigbuild_cmd).await?;
     };
     let bin_path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
         .join("target")
@@ -378,14 +393,65 @@ async fn build_remote_server_from_source(
 }
 
 #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+fn apply_path_env(command: &mut util::command::Command, path: Option<&str>) {
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+fn merged_path_env(extra_path: Option<&str>) -> Option<String> {
+    match (extra_path, std::env::var("PATH").ok()) {
+        (Some(extra_path), Some(current_path)) if extra_path.is_empty() => Some(current_path),
+        (Some(extra_path), Some(current_path)) if current_path.is_empty() => {
+            Some(extra_path.to_string())
+        }
+        (Some(extra_path), Some(current_path)) if extra_path == current_path => Some(current_path),
+        (Some(extra_path), Some(current_path)) => Some(format!("{extra_path}:{current_path}")),
+        (Some(extra_path), None) => Some(extra_path.to_string()),
+        (None, Some(current_path)) => Some(current_path),
+        (None, None) => None,
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+async fn login_shell_path_env() -> Option<String> {
+    #[cfg(unix)]
+    {
+        match util::shell_env::capture(util::get_system_shell(), &[], util::paths::home_dir()).await
+        {
+            Ok(env) => env.get("PATH").cloned(),
+            Err(err) => {
+                log::warn!("Failed to capture login shell PATH for remote build tools: {err:#}");
+                None
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
 async fn which(
     binary_name: impl AsRef<str>,
+    search_path: Option<&str>,
     cx: &mut AsyncApp,
 ) -> Result<Option<std::path::PathBuf>> {
     let binary_name = binary_name.as_ref().to_string();
     let binary_name_cloned = binary_name.clone();
+    let search_path = search_path.map(ToOwned::to_owned);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| util::paths::home_dir().clone());
     let res = cx
-        .background_spawn(async move { which::which(binary_name_cloned) })
+        .background_spawn(async move {
+            if let Some(search_path) = search_path.as_deref() {
+                which::which_in(&binary_name_cloned, Some(search_path), cwd)
+            } else {
+                which::which(&binary_name_cloned)
+            }
+        })
         .await;
     match res {
         Ok(path) => Ok(Some(path)),

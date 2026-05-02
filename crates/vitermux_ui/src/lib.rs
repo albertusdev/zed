@@ -886,18 +886,22 @@ impl VitermuxPanel {
             )?;
             if let Some(focused_workspace) = focused_workspace {
                 if review_companion_enabled {
-                    let plan =
-                        match fetch_open_plan_with_cache(&client, &open_plan_cache, &session_key, &row)
-                            .await
-                        {
-                            Ok(plan) => plan,
-                            Err(error) => {
-                                if !is_latest_open_request(&open_request_tracker, request_id) {
-                                    return Ok(());
-                                }
-                                return Err(error);
+                    let plan = match fetch_open_plan_with_cache(
+                        &client,
+                        &open_plan_cache,
+                        &session_key,
+                        &row,
+                    )
+                    .await
+                    {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            if !is_latest_open_request(&open_request_tracker, request_id) {
+                                return Ok(());
                             }
-                        };
+                            return Err(error);
+                        }
+                    };
                     if is_latest_open_request(&open_request_tracker, request_id) {
                         let _ = sync_review_companion_for_terminal_open(
                             focused_workspace,
@@ -916,7 +920,8 @@ impl VitermuxPanel {
                 return Ok(());
             }
             let plan =
-                match fetch_open_plan_with_cache(&client, &open_plan_cache, &session_key, &row).await
+                match fetch_open_plan_with_cache(&client, &open_plan_cache, &session_key, &row)
+                    .await
                 {
                     Ok(plan) => plan,
                     Err(error) => {
@@ -1945,7 +1950,9 @@ async fn ensure_project_workspace_for_plan(
         )
     })?;
 
-    open_task.await
+    let result = open_task.await;
+    remote_connection::dismiss_connection_modal(&source_workspace, cx);
+    result
 }
 
 struct ProjectWorkspaceResolution {
