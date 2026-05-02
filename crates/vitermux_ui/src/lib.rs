@@ -22,8 +22,8 @@ use task::{
 };
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use ui::{
-    Color, Disableable, Icon, IconButton, IconName, IconSize, Label, LabelSize, ListItem,
-    ListItemSpacing, Toggleable, Tooltip, prelude::*,
+    Color, Disableable, Icon, IconButton, IconName, IconSize, KeyBinding, Label, LabelSize,
+    ListItem, ListItemSpacing, Toggleable, Tooltip, prelude::*,
 };
 use vitermux::{
     OpenPlanFailure, TmuxTreeSnapshot, TmuxWindow, VitermuxClient, VitermuxConnectionState,
@@ -1311,9 +1311,12 @@ impl VitermuxPanel {
                             .gap_1()
                             .when_some(assigned_slot, |this, slot_index| {
                                 this.child(
-                                    Label::new(format!("⌘{}", slot_number(slot_index)))
-                                        .size(LabelSize::XSmall)
-                                        .color(if disabled { Color::Disabled } else { Color::Muted }),
+                                    KeyBinding::for_action_in(
+                                        &ActivateSlot(slot_index),
+                                        &self.focus_handle,
+                                        cx,
+                                    )
+                                    .disabled(disabled),
                                 )
                             })
                             .when(show_review, |this| {
@@ -3069,6 +3072,38 @@ mod tests {
     #[test]
     fn default_keymap_binds_review_companion_toggle_in_vitermux_contexts() {
         let keymap = include_str!("../../../assets/keymaps/default-macos.json");
+        assert!(
+            keymap.contains(
+                r#""context": "VitermuxPanel || (Terminal && vitermux_terminal)""#
+            ) && keymap.contains(r#""alt-cmd-/": "vitermux_panel::ToggleReviewCompanion""#),
+            "vitermux panel and terminal contexts should bind the review companion toggle"
+        );
+        assert!(
+            keymap.contains(r#""context": "Workspace && VitermuxOperatorWorkspace""#)
+                && keymap.contains(r#""alt-cmd-/": "vitermux_panel::ToggleReviewCompanion""#),
+            "operator workspace context should also bind the review companion toggle"
+        );
+    }
+
+    #[test]
+    fn default_linux_keymap_places_operator_workspace_slot_bindings_after_workspace_pane_bindings() {
+        let keymap = include_str!("../../../assets/keymaps/default-linux.json");
+        let pane_bindings = keymap
+            .find(r#""alt-9": ["workspace::ActivatePane", 8]"#)
+            .expect("workspace pane bindings should exist");
+        let operator_bindings = keymap
+            .find(r#""context": "Workspace && VitermuxOperatorWorkspace""#)
+            .expect("operator workspace binding block should exist");
+
+        assert!(
+            operator_bindings > pane_bindings,
+            "operator workspace slot bindings must come after plain workspace pane bindings"
+        );
+    }
+
+    #[test]
+    fn default_linux_keymap_binds_review_companion_toggle_in_vitermux_contexts() {
+        let keymap = include_str!("../../../assets/keymaps/default-linux.json");
         assert!(
             keymap.contains(
                 r#""context": "VitermuxPanel || (Terminal && vitermux_terminal)""#
