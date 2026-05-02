@@ -1,4 +1,13 @@
-use std::{cmp, path::PathBuf, process::ExitStatus, sync::Arc, time::Duration};
+use std::{
+    cmp,
+    path::PathBuf,
+    process::ExitStatus,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use crate::{
     TerminalView, default_working_directory,
@@ -82,9 +91,22 @@ pub struct TerminalPanel {
     pending_serialization: Task<Option<()>>,
     pending_terminals_to_add: usize,
     deferred_tasks: HashMap<TaskId, Task<()>>,
+    pending_center_spawns: HashMap<TaskId, PendingCenterSpawn>,
     assistant_enabled: bool,
     assistant_tab_bar_button: Option<AnyView>,
     active: bool,
+}
+
+#[derive(Clone)]
+enum PendingCenterSpawnOutcome {
+    Materialized,
+    OwnerStale,
+    Failed(String),
+}
+
+struct PendingCenterSpawn {
+    has_waiters: Arc<AtomicBool>,
+    waiters: Vec<oneshot::Sender<PendingCenterSpawnOutcome>>,
 }
 
 impl TerminalPanel {
@@ -100,6 +122,7 @@ impl TerminalPanel {
             pending_serialization: Task::ready(None),
             pending_terminals_to_add: 0,
             deferred_tasks: HashMap::default(),
+            pending_center_spawns: HashMap::default(),
             assistant_enabled: false,
             assistant_tab_bar_button: None,
             active: false,
@@ -632,6 +655,17 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<WeakEntity<Terminal>>> {
+        self.spawn_task_in_center_pane_with_guard(task, pane, Arc::new(|| true), window, cx)
+    }
+
+    pub fn spawn_task_in_center_pane_with_guard(
+        &mut self,
+        task: &SpawnInTerminal,
+        pane: Entity<Pane>,
+        should_materialize: Arc<dyn Fn() -> bool + Send + Sync>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
         let Some(workspace) = self.workspace.upgrade() else {
             return Task::ready(Err(anyhow!("failed to read workspace")));
         };
@@ -658,17 +692,129 @@ impl TerminalPanel {
 
         let task = prepare_task_for_spawn(task, &shell, is_windows);
 
-        self.workspace
+        if !(task.allow_concurrent_runs && task.use_new_terminal) {
+            let mut terminals_for_task = self.terminals_for_task(&task.full_label, cx);
+            if let Some((existing_item_index, task_pane, existing_terminal)) =
+                terminals_for_task.pop()
+            {
+                if task.allow_concurrent_runs {
+                    return self.replace_terminal(
+                        task,
+                        task_pane,
+                        existing_item_index,
+                        existing_terminal,
+                        window,
+                        cx,
+                    );
+                }
+
+                self.activate_terminal_view(&task_pane, existing_item_index, true, window, cx);
+                let terminal = existing_terminal.read(cx).terminal().downgrade();
+                return Task::ready(Ok(terminal));
+            }
+        }
+
+        if !task.allow_concurrent_runs {
+            if let Some(pending_spawn) = self.pending_center_spawns.get_mut(&task.id) {
+                let task_label = task.full_label.clone();
+                let retry_task = task.clone();
+                let retry_pane = pane.clone();
+                let should_materialize = should_materialize.clone();
+                let (tx, rx) = oneshot::channel();
+                pending_spawn.has_waiters.store(true, Ordering::Relaxed);
+                pending_spawn.waiters.push(tx);
+                return cx.spawn_in(window, async move |terminal_panel, cx| {
+                    match rx.await {
+                        Ok(PendingCenterSpawnOutcome::Materialized) => {
+                            if !should_materialize() {
+                                return Ok(WeakEntity::new_invalid());
+                            }
+                            terminal_panel.update_in(cx, |panel, window, cx| {
+                                let mut terminals_for_task = panel.terminals_for_task(&task_label, cx);
+                                let Some((existing_item_index, task_pane, existing_terminal)) =
+                                    terminals_for_task.pop()
+                                else {
+                                    return Err(anyhow!(
+                                        "center terminal spawn completed without a materialized terminal"
+                                    ));
+                                };
+                                panel.activate_terminal_view(
+                                    &task_pane,
+                                    existing_item_index,
+                                    true,
+                                    window,
+                                    cx,
+                                );
+                                Ok(existing_terminal.read(cx).terminal().downgrade())
+                            })?
+                        }
+                        Ok(PendingCenterSpawnOutcome::OwnerStale) => {
+                            if !should_materialize() {
+                                return Ok(WeakEntity::new_invalid());
+                            }
+                            let retry = terminal_panel.update_in(cx, |panel, window, cx| {
+                                panel.spawn_task_in_center_pane_with_guard(
+                                    &retry_task,
+                                    retry_pane.clone(),
+                                    should_materialize.clone(),
+                                    window,
+                                    cx,
+                                )
+                            })?;
+                            retry.await
+                        }
+                        Ok(PendingCenterSpawnOutcome::Failed(message)) => Err(anyhow!(message)),
+                        Err(_) => Err(anyhow!("center terminal spawn was canceled")),
+                    }
+                });
+            }
+        }
+
+        if !should_materialize() {
+            return Task::ready(Ok(WeakEntity::new_invalid()));
+        }
+
+        let task_id = task.id.clone();
+        let pending_spawn = self
+            .pending_center_spawns
+            .entry(task_id.clone())
+            .or_insert_with(|| PendingCenterSpawn {
+                has_waiters: Arc::new(AtomicBool::new(false)),
+                waiters: Vec::new(),
+            });
+        let has_waiters = pending_spawn.has_waiters.clone();
+
+        let spawn_task = self
+            .workspace
             .update(cx, |workspace, cx| {
-                Self::add_center_terminal_in_pane(
+                Self::add_center_terminal_in_pane_with_guard(
                     workspace,
                     pane,
+                    should_materialize.clone(),
+                    has_waiters.clone(),
                     window,
                     cx,
                     move |project, cx| project.create_terminal_task(task, cx),
                 )
             })
-            .unwrap_or_else(|e| Task::ready(Err(e)))
+            .unwrap_or_else(|e| Task::ready(Err(e)));
+
+        cx.spawn_in(window, async move |terminal_panel, cx| {
+            let result = spawn_task.await;
+            let waiter_result = match &result {
+                Ok(terminal) if terminal.upgrade().is_some() => PendingCenterSpawnOutcome::Materialized,
+                Ok(_) => PendingCenterSpawnOutcome::OwnerStale,
+                Err(error) => PendingCenterSpawnOutcome::Failed(error.to_string()),
+            };
+            let _ = terminal_panel.update(cx, |panel, _| {
+                if let Some(pending_spawn) = panel.pending_center_spawns.remove(&task_id) {
+                    for waiter in pending_spawn.waiters {
+                        let _ = waiter.send(waiter_result.clone());
+                    }
+                }
+            });
+            result
+        })
     }
 
     fn spawn_in_new_terminal(
@@ -756,7 +902,10 @@ impl TerminalPanel {
                 .filter_map(|(index, item)| Some((index, item.act_as::<TerminalView>(cx)?)))
                 .filter_map(|(index, terminal_view)| {
                     let task_state = terminal_view.read(cx).terminal().read(cx).task()?;
-                    if &task_state.spawned_task.full_label == label {
+                    if terminal_task_label_matches(
+                        task_state.spawned_task.full_label.as_str(),
+                        label,
+                    ) {
                         Some((index, terminal_view))
                     } else {
                         None
@@ -820,6 +969,30 @@ impl TerminalPanel {
         ) -> Task<Result<Entity<Terminal>>>
         + 'static,
     ) -> Task<Result<WeakEntity<Terminal>>> {
+        Self::add_center_terminal_in_pane_with_guard(
+            workspace,
+            pane,
+            Arc::new(|| true),
+            Arc::new(AtomicBool::new(false)),
+            window,
+            cx,
+            create_terminal,
+        )
+    }
+
+    fn add_center_terminal_in_pane_with_guard(
+        workspace: &mut Workspace,
+        pane: Entity<Pane>,
+        should_materialize: Arc<dyn Fn() -> bool + Send + Sync>,
+        has_waiters: Arc<AtomicBool>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+        create_terminal: impl FnOnce(
+            &mut Project,
+            &mut Context<Project>,
+        ) -> Task<Result<Entity<Terminal>>>
+        + 'static,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
         if !is_enabled_in_workspace(workspace, cx) {
             return Task::ready(Err(anyhow!(
                 "terminal not yet supported for remote projects"
@@ -827,7 +1000,14 @@ impl TerminalPanel {
         }
         let project = workspace.project().downgrade();
         cx.spawn_in(window, async move |workspace, cx| {
+            if !should_materialize() {
+                return Ok(WeakEntity::new_invalid());
+            }
             let terminal = project.update(cx, create_terminal)?.await?;
+            let focus_terminal = should_materialize();
+            if !focus_terminal && !has_waiters.load(Ordering::Relaxed) {
+                return Ok(WeakEntity::new_invalid());
+            }
 
             workspace.update_in(cx, |workspace, window, cx| {
                 let target_pane = workspace
@@ -850,8 +1030,8 @@ impl TerminalPanel {
                     target_pane,
                     Box::new(terminal_view),
                     None,
-                    true,
-                    true,
+                    focus_terminal,
+                    focus_terminal,
                     window,
                     cx,
                 );
@@ -1361,6 +1541,15 @@ async fn wait_for_terminals_tasks(
     join_all(pending_tasks).await;
 }
 
+fn terminal_task_label_matches(left: &str, right: &str) -> bool {
+    left == right
+        || normalize_vitermux_terminal_label(left) == normalize_vitermux_terminal_label(right)
+}
+
+fn normalize_vitermux_terminal_label(label: &str) -> &str {
+    label.strip_prefix("vitermux:").unwrap_or(label)
+}
+
 struct FailedToSpawnTerminal {
     error: String,
     focus_handle: FocusHandle,
@@ -1805,6 +1994,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use project::FakeFs;
     use settings::SettingsStore;
+    use task::HideStrategy;
     use workspace::MultiWorkspace;
 
     #[test]
@@ -2012,6 +2202,107 @@ mod tests {
             .expect("Failed to initialize workspace with terminal panel");
 
         (window_handle, terminal_panel)
+    }
+
+    #[gpui::test]
+    async fn spawn_task_in_center_pane_reuses_existing_vitermux_terminal_alias(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let existing_task = SpawnInTerminal {
+            id: TaskId("vitermux:node:local/acct:me/sess:zed-tabs/win:index:1".into()),
+            full_label: "vitermux:node:local/acct:me/sess:zed-tabs/win:index:1".into(),
+            label: "zed-pristine-a".into(),
+            reveal: RevealStrategy::Always,
+            reveal_target: RevealTarget::Center,
+            hide: HideStrategy::Never,
+            ..SpawnInTerminal::default()
+        };
+        let reuse_task = SpawnInTerminal {
+            id: TaskId("node:local/acct:me/sess:zed-tabs/win:index:1".into()),
+            full_label: "node:local/acct:me/sess:zed-tabs/win:index:1".into(),
+            label: "zed-pristine-a".into(),
+            reveal: RevealStrategy::Always,
+            reveal_target: RevealTarget::Center,
+            hide: HideStrategy::Never,
+            ..SpawnInTerminal::default()
+        };
+
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    TerminalPanel::add_center_terminal(workspace, window, cx, {
+                        let existing_task = existing_task.clone();
+                        move |project, cx| project.create_terminal_task(existing_task, cx)
+                    })
+                })
+            })
+            .expect("Failed to update workspace")
+            .await
+            .expect("Failed to create existing center terminal");
+        cx.run_until_parked();
+
+        let terminal_count_before = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .panes()
+                    .iter()
+                    .flat_map(|pane| pane.read(cx).items_of_type::<TerminalView>())
+                    .count()
+            })
+            .expect("Failed to count center terminals before reuse");
+        assert_eq!(terminal_count_before, 1);
+
+        let reuse_pane = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace.workspace().read(cx).active_pane().clone()
+            })
+            .expect("Failed to read reuse pane");
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.spawn_task_in_center_pane(&reuse_task, reuse_pane, window, cx)
+                })
+            })
+            .expect("Failed to dispatch center-pane reuse")
+            .await
+            .expect("Failed to reuse existing center terminal");
+        cx.run_until_parked();
+
+        let terminal_count_after = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .panes()
+                    .iter()
+                    .flat_map(|pane| pane.read(cx).items_of_type::<TerminalView>())
+                    .count()
+            })
+            .expect("Failed to count center terminals after reuse");
+        assert_eq!(
+            terminal_count_after, 1,
+            "center-pane Vitermux reopen should reuse the warm terminal instead of creating a duplicate"
+        );
+
+        let focused_label = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                let workspace = multi_workspace.workspace();
+                let active_item = workspace.read(cx).active_item(cx)?;
+                let terminal_view = active_item.act_as::<TerminalView>(cx)?;
+                let task = terminal_view.read(cx).terminal().read(cx).task()?;
+                Some(task.spawned_task.full_label.clone())
+            })
+            .expect("Failed to read focused terminal label");
+        assert_eq!(
+            focused_label.as_deref(),
+            Some(existing_task.full_label.as_str())
+        );
     }
 
     #[gpui::test]

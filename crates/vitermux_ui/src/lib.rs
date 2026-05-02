@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use collections::{HashMap, HashSet};
+use collections::HashMap;
 use db::kvp::KeyValueStore;
 use git_ui::project_diff::ProjectDiff;
 use gpui::{
@@ -103,7 +103,9 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(|workspace, action: &AssignSelectedToSlot, window, cx| {
             if let Some(panel) = workspace.panel::<VitermuxPanel>(cx) {
-                panel.update(cx, |panel, cx| panel.assign_selected_to_slot(action, window, cx));
+                panel.update(cx, |panel, cx| {
+                    panel.assign_selected_to_slot(action, window, cx)
+                });
             }
         });
     })
@@ -172,6 +174,12 @@ impl Default for SerializedReviewCompanionState {
     }
 }
 
+#[derive(Default)]
+struct OpenRequestTracker {
+    next_request_id: u64,
+    latest_request_id: u64,
+}
+
 #[derive(Clone)]
 enum DisplayRow {
     NodeHeader {
@@ -193,7 +201,7 @@ pub struct VitermuxPanel {
     store: Entity<VitermuxStore>,
     focus_handle: FocusHandle,
     list_state: ListState,
-    pending_open_keys: Arc<Mutex<HashSet<String>>>,
+    open_request_tracker: Arc<Mutex<OpenRequestTracker>>,
     open_plan_cache: Arc<Mutex<HashMap<String, ZedOpenPlan>>>,
     rows: Vec<WorkbenchRow>,
     display_rows: Vec<DisplayRow>,
@@ -277,7 +285,7 @@ impl VitermuxPanel {
             store: store.clone(),
             focus_handle: cx.focus_handle(),
             list_state,
-            pending_open_keys: Arc::default(),
+            open_request_tracker: Arc::default(),
             open_plan_cache: Arc::default(),
             rows: Vec::new(),
             display_rows: Vec::new(),
@@ -418,7 +426,9 @@ impl VitermuxPanel {
             return;
         };
         if !self.operator_workspace_enabled {
-            if self.focus_handle.contains_focused(window, cx) || self.last_focused_terminal_key.is_some() {
+            if self.focus_handle.contains_focused(window, cx)
+                || self.last_focused_terminal_key.is_some()
+            {
                 self.enable_operator_workspace_mode(window, cx);
             } else {
                 window.dispatch_action(workspace::ActivatePane(slot_index).boxed_clone(), cx);
@@ -850,14 +860,12 @@ impl VitermuxPanel {
         } else {
             row.row_key.to_string()
         };
-        if !self.pending_open_keys.lock().insert(open_key.clone()) {
-            return Task::ready(Ok(()));
-        }
-        let pending_open_keys = self.pending_open_keys.clone();
         let open_plan_cache = self.open_plan_cache.clone();
         let requesting_window = window.window_handle().downcast::<MultiWorkspace>();
         let preferred_terminal_key = self.last_focused_terminal_key.clone();
         let review_companion_enabled = self.review_companion_enabled;
+        let open_request_tracker = self.open_request_tracker.clone();
+        let request_id = begin_open_request(&open_request_tracker);
         let session_key = row
             .session_key
             .clone()
@@ -865,145 +873,185 @@ impl VitermuxPanel {
             .map(|id| id.to_string());
 
         window.spawn(cx, async move |cx| {
-            let result = async {
-                let workspace = workspace?;
-                let session_key = session_key?;
-                let focused_workspace = focus_existing_terminal_in_operator_window(
-                    workspace.clone(),
-                    requesting_window.clone(),
-                    &open_key,
-                    cx,
-                )?;
-                if let Some(focused_workspace) = focused_workspace {
-                    if review_companion_enabled {
-                        let plan = fetch_open_plan_with_cache(
-                            &client,
-                            &open_plan_cache,
-                            &session_key,
-                            &row,
-                        )
-                        .await?;
-                        if let Err(error) = sync_review_companion_for_terminal_open(
+            let workspace = workspace?;
+            let session_key = session_key?;
+            if !is_latest_open_request(&open_request_tracker, request_id) {
+                return Ok(());
+            }
+            let focused_workspace = focus_existing_terminal_in_operator_window(
+                workspace.clone(),
+                requesting_window.clone(),
+                &open_key,
+                cx,
+            )?;
+            if let Some(focused_workspace) = focused_workspace {
+                if review_companion_enabled {
+                    let plan =
+                        match fetch_open_plan_with_cache(&client, &open_plan_cache, &session_key, &row)
+                            .await
+                        {
+                            Ok(plan) => plan,
+                            Err(error) => {
+                                if !is_latest_open_request(&open_request_tracker, request_id) {
+                                    return Ok(());
+                                }
+                                return Err(error);
+                            }
+                        };
+                    if is_latest_open_request(&open_request_tracker, request_id) {
+                        let _ = sync_review_companion_for_terminal_open(
                             focused_workspace,
                             &row,
                             &plan,
                             &open_key,
                             cx,
                         )
-                        .await
-                        {
-                            let _ = error;
-                        }
+                        .await;
                     }
-                    return Ok(());
                 }
+                return Ok(());
+            }
 
-                let plan =
-                    fetch_open_plan_with_cache(&client, &open_plan_cache, &session_key, &row)
-                        .await?;
-                let resolved_workspace = match resolve_project_workspace_for_plan(
+            if !is_latest_open_request(&open_request_tracker, request_id) {
+                return Ok(());
+            }
+            let plan =
+                match fetch_open_plan_with_cache(&client, &open_plan_cache, &session_key, &row).await
+                {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        if !is_latest_open_request(&open_request_tracker, request_id) {
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
+                };
+            if !is_latest_open_request(&open_request_tracker, request_id) {
+                return Ok(());
+            }
+            let resolved_workspace = match resolve_project_workspace_for_plan(
+                workspace.clone(),
+                requesting_window.clone(),
+                &plan,
+                cx,
+            )
+            .await
+            {
+                Ok(resolution) => resolution,
+                Err(error) => {
+                    if !is_latest_open_request(&open_request_tracker, request_id) {
+                        return Ok(());
+                    }
+                    let source_workspace_is_remote = workspace
+                        .read_with(cx, |workspace, cx| workspace.project().read(cx).is_remote());
+                    if !allow_source_workspace_attach_fallback(source_workspace_is_remote) {
+                        if !is_latest_open_request(&open_request_tracker, request_id) {
+                            return Ok(());
+                        }
+                        return Err(error.context(
+                            "cannot safely fall back to attach from a remote source workspace",
+                        ));
+                    }
+                    ProjectWorkspaceResolution {
+                        workspace: workspace.clone(),
+                        matched_project_context: false,
+                    }
+                }
+            };
+            if !is_latest_open_request(&open_request_tracker, request_id) {
+                return Ok(());
+            }
+            let workspace = resolved_workspace.workspace;
+            if resolved_workspace.matched_project_context {
+                let _ = sync_workspace_project_context_for_plan(
                     workspace.clone(),
-                    requesting_window.clone(),
                     &plan,
+                    ProjectContextSyncMode::BestEffort,
                     cx,
                 )
-                .await
-                {
-                    Ok(resolution) => resolution,
-                    Err(error) => {
-                        let source_workspace_is_remote = workspace
-                            .read_with(cx, |workspace, cx| {
-                                workspace.project().read(cx).is_remote()
-                            });
-                        if !allow_source_workspace_attach_fallback(source_workspace_is_remote) {
-                            return Err(error.context(
-                                "cannot safely fall back to attach from a remote source workspace",
-                            ));
-                        }
-                        ProjectWorkspaceResolution {
-                            workspace: workspace.clone(),
-                            matched_project_context: false,
-                        }
-                    }
-                };
-                let workspace = resolved_workspace.workspace;
-                if resolved_workspace.matched_project_context {
-                    let _ = sync_workspace_project_context_for_plan(
-                        workspace.clone(),
-                        &plan,
-                        ProjectContextSyncMode::BestEffort,
-                        cx,
-                    )
-                    .await;
-                }
-                let workspace_is_remote = workspace
-                    .read_with(cx, |workspace, cx| workspace.project().read(cx).is_remote());
-                let spawn_inside_target_remote_workspace = attach_inside_target_remote_workspace(
-                    &plan,
-                    resolved_workspace.matched_project_context,
-                    workspace_is_remote,
-                );
-                let spawn_task = build_spawn_task(
-                    &row,
-                    &plan,
-                    spawn_inside_target_remote_workspace,
-                    workspace_is_remote,
-                )?;
-                let terminal_key = spawn_task.full_label.clone();
-                let terminal_panel =
-                    workspace.read_with(cx, |workspace, cx| workspace.panel::<TerminalPanel>(cx));
-                let focused_workspace = focus_existing_terminal_in_operator_window(
-                    workspace.clone(),
-                    requesting_window.clone(),
-                    &terminal_key,
-                    cx,
-                )?;
-                if let Some(focused_workspace) = focused_workspace {
-                    if review_companion_enabled {
-                        if let Err(error) = sync_review_companion_for_terminal_open(
-                            focused_workspace,
-                            &row,
-                            &plan,
-                            &terminal_key,
-                            cx,
-                        )
-                        .await
-                        {
-                            let _ = error;
-                        }
-                    }
+                .await;
+                if !is_latest_open_request(&open_request_tracker, request_id) {
                     return Ok(());
                 }
-
-                let preferred_pane = workspace.update_in(cx, |workspace, _window, cx| {
-                    preferred_terminal_spawn_pane(workspace, preferred_terminal_key.as_deref(), cx)
-                })?;
-                let Some(terminal_panel) = terminal_panel else {
-                    return Err(anyhow!("terminal panel is not available"));
-                };
-                let terminal_task = terminal_panel.update_in(cx, |panel, window, cx| {
-                    panel.spawn_task_in_center_pane(&spawn_task, preferred_pane, window, cx)
-                })?;
-                terminal_task.await?;
-                if review_companion_enabled {
-                    if let Err(error) = sync_review_companion_for_terminal_open(
-                        workspace.clone(),
+            }
+            let workspace_is_remote =
+                workspace.read_with(cx, |workspace, cx| workspace.project().read(cx).is_remote());
+            let spawn_inside_target_remote_workspace = attach_inside_target_remote_workspace(
+                &plan,
+                resolved_workspace.matched_project_context,
+                workspace_is_remote,
+            );
+            let spawn_task = build_spawn_task(
+                &row,
+                &plan,
+                spawn_inside_target_remote_workspace,
+                workspace_is_remote,
+            )?;
+            let terminal_key = spawn_task.full_label.clone();
+            let terminal_panel =
+                workspace.read_with(cx, |workspace, cx| workspace.panel::<TerminalPanel>(cx));
+            if !is_latest_open_request(&open_request_tracker, request_id) {
+                return Ok(());
+            }
+            let focused_workspace = focus_existing_terminal_in_operator_window(
+                workspace.clone(),
+                requesting_window.clone(),
+                &terminal_key,
+                cx,
+            )?;
+            if let Some(focused_workspace) = focused_workspace {
+                if review_companion_enabled
+                    && is_latest_open_request(&open_request_tracker, request_id)
+                {
+                    let _ = sync_review_companion_for_terminal_open(
+                        focused_workspace,
                         &row,
                         &plan,
                         &terminal_key,
                         cx,
                     )
-                    .await
-                    {
-                        let _ = error;
-                    }
+                    .await;
                 }
-                Ok(())
+                return Ok(());
             }
-            .await;
 
-            pending_open_keys.lock().remove(&open_key);
-            result
+            if !is_latest_open_request(&open_request_tracker, request_id) {
+                return Ok(());
+            }
+            let preferred_pane = workspace.update_in(cx, |workspace, _window, cx| {
+                preferred_terminal_spawn_pane(workspace, preferred_terminal_key.as_deref(), cx)
+            })?;
+            let Some(terminal_panel) = terminal_panel else {
+                return Err(anyhow!("terminal panel is not available"));
+            };
+            let terminal_task = terminal_panel.update_in(cx, |panel, window, cx| {
+                let open_request_tracker = open_request_tracker.clone();
+                panel.spawn_task_in_center_pane_with_guard(
+                    &spawn_task,
+                    preferred_pane,
+                    Arc::new(move || is_latest_open_request(&open_request_tracker, request_id)),
+                    window,
+                    cx,
+                )
+            })?;
+            if let Err(error) = terminal_task.await {
+                if !is_latest_open_request(&open_request_tracker, request_id) {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            if review_companion_enabled && is_latest_open_request(&open_request_tracker, request_id)
+            {
+                let _ = sync_review_companion_for_terminal_open(
+                    workspace.clone(),
+                    &row,
+                    &plan,
+                    &terminal_key,
+                    cx,
+                )
+                .await;
+            }
+            Ok(())
         })
     }
 
@@ -1077,27 +1125,27 @@ impl VitermuxPanel {
             match mode {
                 ReviewOpenMode::ExplicitOpen => {
                     workspace.update_in(cx, |workspace, window, cx| {
-                    let review_pane = terminal_pane_for_row(workspace, &row, cx)
-                        .map(|terminal_pane| {
-                            workspace.adjacent_pane_from(
-                                terminal_pane,
-                                workspace::SplitDirection::Right,
-                                window,
-                                cx,
-                            )
-                        })
-                        .or_else(|| find_review_diff_pane(workspace, cx))
-                        .unwrap_or_else(|| workspace.adjacent_pane(window, cx));
-                    ProjectDiff::deploy_at_project_path_in_pane(
-                        workspace,
-                        review_pane,
-                        project_path,
-                        true,
-                        true,
-                        true,
-                        window,
-                        cx,
-                    );
+                        let review_pane = terminal_pane_for_row(workspace, &row, cx)
+                            .map(|terminal_pane| {
+                                workspace.adjacent_pane_from(
+                                    terminal_pane,
+                                    workspace::SplitDirection::Right,
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .or_else(|| find_review_diff_pane(workspace, cx))
+                            .unwrap_or_else(|| workspace.adjacent_pane(window, cx));
+                        ProjectDiff::deploy_at_project_path_in_pane(
+                            workspace,
+                            review_pane,
+                            project_path,
+                            true,
+                            true,
+                            true,
+                            window,
+                            cx,
+                        );
                     })?;
                 }
                 ReviewOpenMode::SyncCompanion {
@@ -1604,8 +1652,8 @@ fn build_row_index_by_session_key(rows: &[WorkbenchRow]) -> HashMap<String, usiz
 fn build_row_index_by_terminal_key(rows: &[WorkbenchRow]) -> HashMap<String, usize> {
     let mut index_by_terminal_key = HashMap::default();
     for (index, row) in rows.iter().enumerate() {
-        index_by_terminal_key.insert(row.row_key.to_string(), index);
-        index_by_terminal_key.insert(row.dedupe_key.to_string(), index);
+        insert_terminal_key_aliases(&mut index_by_terminal_key, row.row_key.as_ref(), index);
+        insert_terminal_key_aliases(&mut index_by_terminal_key, row.dedupe_key.as_ref(), index);
     }
     index_by_terminal_key
 }
@@ -1675,7 +1723,12 @@ fn build_assigned_slot_by_row_key(
         .enumerate()
         .filter_map(|(slot_index, slot)| {
             let slot = slot.as_ref()?;
-            let row = row_for_session_slot(slot, rows, row_index_by_session_key, row_index_by_terminal_key)?;
+            let row = row_for_session_slot(
+                slot,
+                rows,
+                row_index_by_session_key,
+                row_index_by_terminal_key,
+            )?;
             Some((row.row_key.to_string(), slot_index))
         })
         .collect()
@@ -1707,11 +1760,10 @@ fn load_operator_workspace_enabled(workspace_key: Option<&str>, cx: &App) -> Opt
     let workspace_key = workspace_key?;
     let kvp = KeyValueStore::global(cx);
     let scope = kvp.scoped(OPERATOR_WORKSPACE_SCOPE_KEY);
-    let state = scope
-        .read(workspace_key)
-        .ok()
-        .flatten()
-        .and_then(|json| serde_json::from_str::<SerializedOperatorWorkspaceState>(&json).ok())?;
+    let state =
+        scope.read(workspace_key).ok().flatten().and_then(|json| {
+            serde_json::from_str::<SerializedOperatorWorkspaceState>(&json).ok()
+        })?;
     Some(state.enabled)
 }
 
@@ -1727,11 +1779,56 @@ fn load_review_companion_enabled(workspace_key: Option<&str>, cx: &App) -> Optio
     Some(state.enabled)
 }
 
+fn begin_open_request(open_request_tracker: &Arc<Mutex<OpenRequestTracker>>) -> u64 {
+    let mut tracker = open_request_tracker.lock();
+    tracker.next_request_id += 1;
+    tracker.latest_request_id = tracker.next_request_id;
+    tracker.latest_request_id
+}
+
+fn is_latest_open_request(
+    open_request_tracker: &Arc<Mutex<OpenRequestTracker>>,
+    request_id: u64,
+) -> bool {
+    open_request_tracker.lock().latest_request_id == request_id
+}
+
+fn looks_like_vitermux_terminal_label(label: &str) -> bool {
+    label.starts_with("vitermux:")
+        || (label.starts_with("node:") && label.contains("/sess:") && label.contains("/win:"))
+}
+
+fn normalize_vitermux_terminal_label(label: &str) -> &str {
+    label.strip_prefix("vitermux:").unwrap_or(label)
+}
+
+fn vitermux_terminal_label_matches(left: &str, right: &str) -> bool {
+    left == right
+        || normalize_vitermux_terminal_label(left) == normalize_vitermux_terminal_label(right)
+}
+
+fn insert_terminal_key_aliases(
+    index_by_terminal_key: &mut HashMap<String, usize>,
+    terminal_key: &str,
+    index: usize,
+) {
+    if terminal_key.trim().is_empty() {
+        return;
+    }
+    index_by_terminal_key.insert(terminal_key.to_string(), index);
+    let normalized = normalize_vitermux_terminal_label(terminal_key);
+    if normalized != terminal_key {
+        index_by_terminal_key.insert(normalized.to_string(), index);
+    } else if looks_like_vitermux_terminal_label(terminal_key) {
+        index_by_terminal_key.insert(format!("vitermux:{terminal_key}"), index);
+    }
+}
+
 fn cached_open_plan_matches_row(plan: &ZedOpenPlan, row: &WorkbenchRow) -> bool {
     let dedupe_key = plan.attach.dedupe_key.trim();
     dedupe_key.is_empty()
-        || dedupe_key == row.dedupe_key.as_ref()
-        || dedupe_key == row.row_key.as_ref()
+        || vitermux_terminal_label_matches(dedupe_key, row.dedupe_key.as_ref())
+        || vitermux_terminal_label_matches(dedupe_key, row.row_key.as_ref())
 }
 
 fn cached_open_plan_for_session(
@@ -1976,7 +2073,12 @@ async fn deploy_review_companion_until_synced(
 
     for attempt in 0..=REVIEW_COMPANION_SYNC_ATTEMPTS {
         let outcome = workspace.update_in(cx, |workspace, window, cx| {
-            if focused_terminal_task_label(workspace, cx).as_deref() != Some(terminal_key.as_str())
+            let focused_terminal_key = focused_terminal_task_label(workspace, cx);
+            if !focused_terminal_key
+                .as_deref()
+                .is_some_and(|focused_terminal_key| {
+                    vitermux_terminal_label_matches(focused_terminal_key, terminal_key.as_str())
+                })
             {
                 return ReviewCompanionSyncOutcome::StaleFocus;
             }
@@ -2032,14 +2134,18 @@ fn deploy_review_companion_for_terminal_key(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    if focused_terminal_task_label(workspace, cx).as_deref() != Some(terminal_key) {
+    let focused_terminal_key = focused_terminal_task_label(workspace, cx);
+    if !focused_terminal_key
+        .as_deref()
+        .is_some_and(|focused_terminal_key| {
+            vitermux_terminal_label_matches(focused_terminal_key, terminal_key)
+        })
+    {
         return;
     }
 
-    let terminal_pane =
-        terminal_pane_for_task_label(workspace, terminal_key, cx).or_else(|| {
-            terminal_pane_for_row(workspace, row, cx)
-        });
+    let terminal_pane = terminal_pane_for_task_label(workspace, terminal_key, cx)
+        .or_else(|| terminal_pane_for_row(workspace, row, cx));
     let Some(terminal_pane) = terminal_pane else {
         return;
     };
@@ -2082,9 +2188,7 @@ async fn wait_for_project_path_repository(
     cx: &mut AsyncWindowContext,
 ) -> Result<Entity<project::git_store::Repository>> {
     for attempt in 0..=PROJECT_REPOSITORY_DISCOVERY_ATTEMPTS {
-        if let Some(repository) =
-            project_path_repository(workspace.clone(), project_path, cx)?
-        {
+        if let Some(repository) = project_path_repository(workspace.clone(), project_path, cx)? {
             return Ok(repository);
         }
 
@@ -2337,7 +2441,8 @@ fn focus_existing_terminal(
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
-    if let Some((pane, ix)) = find_existing_terminal_target(workspace, terminal_panel, full_label, cx)
+    if let Some((pane, ix)) =
+        find_existing_terminal_target(workspace, terminal_panel, full_label, cx)
     {
         pane.update(cx, |pane, cx| {
             pane.activate_item(ix, true, true, window, cx)
@@ -2381,14 +2486,16 @@ fn focus_existing_terminal_in_multi_workspace(
     let mut workspaces = multi_workspace.workspaces().cloned().collect::<Vec<_>>();
     workspaces.sort_by_key(|workspace| workspace.entity_id() != active_workspace_id);
 
-    let Some((candidate_workspace, pane, ix)) = workspaces.into_iter().find_map(|candidate_workspace| {
-        let terminal_panel =
-            candidate_workspace.read_with(cx, |workspace, cx| workspace.panel::<TerminalPanel>(cx));
-        let target = candidate_workspace.read_with(cx, |workspace, cx| {
-            find_existing_terminal_target(workspace, terminal_panel.clone(), full_label, cx)
-        })?;
-        Some((candidate_workspace, target.0, target.1))
-    }) else {
+    let Some((candidate_workspace, pane, ix)) =
+        workspaces.into_iter().find_map(|candidate_workspace| {
+            let terminal_panel = candidate_workspace
+                .read_with(cx, |workspace, cx| workspace.panel::<TerminalPanel>(cx));
+            let target = candidate_workspace.read_with(cx, |workspace, cx| {
+                find_existing_terminal_target(workspace, terminal_panel.clone(), full_label, cx)
+            })?;
+            Some((candidate_workspace, target.0, target.1))
+        })
+    else {
         return None;
     };
 
@@ -2422,7 +2529,8 @@ fn find_existing_terminal_target(
         pane.read(cx).items().enumerate().find_map(|(ix, item)| {
             let terminal_view = item.act_as::<TerminalView>(cx)?;
             let task = terminal_view.read(cx).terminal().read(cx).task()?;
-            (task.spawned_task.full_label == full_label).then_some((pane.clone(), ix))
+            vitermux_terminal_label_matches(task.spawned_task.full_label.as_str(), full_label)
+                .then_some((pane.clone(), ix))
         })
     })
 }
@@ -2465,7 +2573,10 @@ fn focused_terminal_task_label(workspace: &Workspace, cx: &App) -> Option<String
 
 fn row_for_terminal_task_label(rows: &[WorkbenchRow], terminal_key: &str) -> Option<WorkbenchRow> {
     rows.iter()
-        .find(|row| row.dedupe_key.as_ref() == terminal_key || row.row_key.as_ref() == terminal_key)
+        .find(|row| {
+            vitermux_terminal_label_matches(row.dedupe_key.as_ref(), terminal_key)
+                || vitermux_terminal_label_matches(row.row_key.as_ref(), terminal_key)
+        })
         .cloned()
 }
 
@@ -2493,7 +2604,12 @@ fn terminal_pane_for_task_label(
                         .terminal()
                         .read(cx)
                         .task()
-                        .is_some_and(|task| task.spawned_task.full_label == terminal_key)
+                        .is_some_and(|task| {
+                            vitermux_terminal_label_matches(
+                                task.spawned_task.full_label.as_str(),
+                                terminal_key,
+                            )
+                        })
                 })
         });
         if !has_match {
@@ -2903,6 +3019,43 @@ mod tests {
     }
 
     #[test]
+    fn row_for_terminal_task_label_matches_vitermux_prefixed_aliases() {
+        let row = sample_row();
+        let rows = vec![row.clone()];
+        let prefixed_row_key = format!("vitermux:{}", row.row_key);
+        let prefixed_dedupe_key = format!("vitermux:{}", row.dedupe_key);
+
+        assert_eq!(
+            row_for_terminal_task_label(&rows, &prefixed_dedupe_key)
+                .expect("prefixed dedupe key should match")
+                .row_key,
+            row.row_key
+        );
+        assert_eq!(
+            row_for_terminal_task_label(&rows, &prefixed_row_key)
+                .expect("prefixed row key should match")
+                .dedupe_key,
+            row.dedupe_key
+        );
+    }
+
+    #[test]
+    fn latest_open_request_tracker_replaces_older_requests() {
+        let tracker = Arc::new(Mutex::new(OpenRequestTracker::default()));
+
+        let request_a = begin_open_request(&tracker);
+        assert!(is_latest_open_request(&tracker, request_a));
+
+        let request_b = begin_open_request(&tracker);
+        assert!(!is_latest_open_request(&tracker, request_a));
+        assert!(is_latest_open_request(&tracker, request_b));
+
+        let request_a_retry = begin_open_request(&tracker);
+        assert!(!is_latest_open_request(&tracker, request_b));
+        assert!(is_latest_open_request(&tracker, request_a_retry));
+    }
+
+    #[test]
     fn seed_session_slots_uses_first_trackable_rows_in_order() {
         let rows = vec![
             WorkbenchRow {
@@ -3073,9 +3226,8 @@ mod tests {
     fn default_keymap_binds_review_companion_toggle_in_vitermux_contexts() {
         let keymap = include_str!("../../../assets/keymaps/default-macos.json");
         assert!(
-            keymap.contains(
-                r#""context": "VitermuxPanel || (Terminal && vitermux_terminal)""#
-            ) && keymap.contains(r#""alt-cmd-/": "vitermux_panel::ToggleReviewCompanion""#),
+            keymap.contains(r#""context": "VitermuxPanel || (Terminal && vitermux_terminal)""#)
+                && keymap.contains(r#""alt-cmd-/": "vitermux_panel::ToggleReviewCompanion""#),
             "vitermux panel and terminal contexts should bind the review companion toggle"
         );
         assert!(
@@ -3086,7 +3238,8 @@ mod tests {
     }
 
     #[test]
-    fn default_linux_keymap_places_operator_workspace_slot_bindings_after_workspace_pane_bindings() {
+    fn default_linux_keymap_places_operator_workspace_slot_bindings_after_workspace_pane_bindings()
+    {
         let keymap = include_str!("../../../assets/keymaps/default-linux.json");
         let pane_bindings = keymap
             .find(r#""alt-9": ["workspace::ActivatePane", 8]"#)
@@ -3105,9 +3258,8 @@ mod tests {
     fn default_linux_keymap_binds_review_companion_toggle_in_vitermux_contexts() {
         let keymap = include_str!("../../../assets/keymaps/default-linux.json");
         assert!(
-            keymap.contains(
-                r#""context": "VitermuxPanel || (Terminal && vitermux_terminal)""#
-            ) && keymap.contains(r#""alt-cmd-/": "vitermux_panel::ToggleReviewCompanion""#),
+            keymap.contains(r#""context": "VitermuxPanel || (Terminal && vitermux_terminal)""#)
+                && keymap.contains(r#""alt-cmd-/": "vitermux_panel::ToggleReviewCompanion""#),
             "vitermux panel and terminal contexts should bind the review companion toggle"
         );
         assert!(
@@ -3441,14 +3593,13 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn cmd_number_switches_between_existing_vitermux_terminals(
-        cx: &mut TestAppContext,
-    ) {
+    async fn cmd_number_switches_between_existing_vitermux_terminals(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/project_a"), json!({ ".git": {} })).await;
+        fs.insert_tree(path!("/project_a"), json!({ ".git": {} }))
+            .await;
         let project = Project::test(fs, [path!("/project_a").as_ref()], cx).await;
 
         let (multi_workspace, window) =
@@ -3495,8 +3646,16 @@ mod tests {
 
         window.update(|_, cx| {
             cx.bind_keys([
-                KeyBinding::new("cmd-1", ActivateSlot(0), Some("Terminal && vitermux_terminal")),
-                KeyBinding::new("cmd-2", ActivateSlot(1), Some("Terminal && vitermux_terminal")),
+                KeyBinding::new(
+                    "cmd-1",
+                    ActivateSlot(0),
+                    Some("Terminal && vitermux_terminal"),
+                ),
+                KeyBinding::new(
+                    "cmd-2",
+                    ActivateSlot(1),
+                    Some("Terminal && vitermux_terminal"),
+                ),
                 KeyBinding::new(
                     "cmd-1",
                     ActivateSlot(0),
@@ -3595,20 +3754,21 @@ mod tests {
         });
         window.run_until_parked();
 
-        let before =
-            workspace.read_with(window, |workspace, cx| focused_terminal_task_label(workspace, cx));
+        let before = workspace.read_with(window, |workspace, cx| {
+            focused_terminal_task_label(workspace, cx)
+        });
         assert_eq!(before.as_deref(), Some(row_a.dedupe_key.as_ref()));
 
-        panel
-            .update_in(window, |panel, window, cx| {
-                panel.sync_to_focused_terminal(workspace.clone(), window, cx);
-            });
+        panel.update_in(window, |panel, window, cx| {
+            panel.sync_to_focused_terminal(workspace.clone(), window, cx);
+        });
         window.run_until_parked();
 
         window.simulate_keystrokes("cmd-2");
 
-        let after =
-            workspace.read_with(window, |workspace, cx| focused_terminal_task_label(workspace, cx));
+        let after = workspace.read_with(window, |workspace, cx| {
+            focused_terminal_task_label(workspace, cx)
+        });
         assert_eq!(after.as_deref(), Some(row_b.dedupe_key.as_ref()));
 
         let selected_row_key = panel.read_with(window, |panel, _| panel.selected_row_key.clone());
@@ -3626,13 +3786,15 @@ mod tests {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/project_a"), json!({ ".git": {} })).await;
-        fs.insert_tree(path!("/project_b"), json!({ ".git": {} })).await;
+        fs.insert_tree(path!("/project_a"), json!({ ".git": {} }))
+            .await;
+        fs.insert_tree(path!("/project_b"), json!({ ".git": {} }))
+            .await;
         let project_a = Project::test(fs.clone(), [path!("/project_a").as_ref()], cx).await;
         let project_b = Project::test(fs, [path!("/project_b").as_ref()], cx).await;
 
-        let (multi_workspace, window) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+        let (multi_workspace, window) = cx
+            .add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
         let workspace_a = multi_workspace.read_with(window, |mw, _| mw.workspace().clone());
         multi_workspace.update_in(window, |mw, window, cx| {
             mw.add(workspace_a.clone(), window, cx);
@@ -3711,12 +3873,21 @@ mod tests {
                 .flat_map(|pane| pane.read(cx).items_of_type::<TerminalView>())
                 .count()
         });
-        assert_eq!(workspace_a_terminal_count, 1, "workspace A should retain one terminal");
-        assert_eq!(workspace_b_terminal_count, 1, "workspace B should retain one terminal");
+        assert_eq!(
+            workspace_a_terminal_count, 1,
+            "workspace A should retain one terminal"
+        );
+        assert_eq!(
+            workspace_b_terminal_count, 1,
+            "workspace B should retain one terminal"
+        );
 
         let retained_workspace_count =
             multi_workspace.read_with(window, |mw, _| mw.workspaces().count());
-        assert_eq!(retained_workspace_count, 2, "operator window should retain both workspaces");
+        assert_eq!(
+            retained_workspace_count, 2,
+            "operator window should retain both workspaces"
+        );
 
         let direct_reuse = multi_workspace.update_in(window, |mw, window, cx| {
             mw.activate(workspace_a.clone(), None, window, cx);
@@ -3731,26 +3902,30 @@ mod tests {
                 )
             })
         });
-        assert!(direct_reuse, "workspace-local focus should find the retained terminal");
+        assert!(
+            direct_reuse,
+            "workspace-local focus should find the retained terminal"
+        );
 
         multi_workspace.update_in(window, |mw, window, cx| {
             mw.activate(workspace_b.clone(), None, window, cx);
         });
         window.run_until_parked();
 
-        let finds_workspace_a_after_activation = multi_workspace.update_in(window, |mw, window, cx| {
-            mw.activate(workspace_a.clone(), None, window, cx);
-            workspace_a.update(cx, |workspace, cx| {
-                let terminal_panel = workspace.panel::<TerminalPanel>(cx);
-                find_existing_terminal_target(
-                    workspace,
-                    terminal_panel,
-                    spawn_task_a.full_label.as_str(),
-                    cx,
-                )
-                .is_some()
-            })
-        });
+        let finds_workspace_a_after_activation =
+            multi_workspace.update_in(window, |mw, window, cx| {
+                mw.activate(workspace_a.clone(), None, window, cx);
+                workspace_a.update(cx, |workspace, cx| {
+                    let terminal_panel = workspace.panel::<TerminalPanel>(cx);
+                    find_existing_terminal_target(
+                        workspace,
+                        terminal_panel,
+                        spawn_task_a.full_label.as_str(),
+                        cx,
+                    )
+                    .is_some()
+                })
+            });
         assert!(
             finds_workspace_a_after_activation,
             "workspace A should expose the retained terminal once activated"
@@ -3779,13 +3954,17 @@ mod tests {
         );
         window.run_until_parked();
 
-        let active_workspace_id = multi_workspace.read_with(window, |mw, _| mw.workspace().entity_id());
+        let active_workspace_id =
+            multi_workspace.read_with(window, |mw, _| mw.workspace().entity_id());
         assert_eq!(active_workspace_id, workspace_a.entity_id());
 
         let focused_label = multi_workspace.read_with(window, |mw, cx| {
             focused_terminal_task_label(mw.workspace().read(cx), cx)
         });
-        assert_eq!(focused_label.as_deref(), Some(spawn_task_a.full_label.as_str()));
+        assert_eq!(
+            focused_label.as_deref(),
+            Some(spawn_task_a.full_label.as_str())
+        );
         assert_eq!(
             workspace_a_terminal_count, 1,
             "reusing a focused tmux tab should not create a second terminal item"
