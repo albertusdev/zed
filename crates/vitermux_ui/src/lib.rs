@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use collections::{HashMap, HashSet};
+use db::kvp::KeyValueStore;
 use git_ui::project_diff::ProjectDiff;
 use gpui::{
     Action, AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
@@ -11,6 +12,8 @@ use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use parking_lot::Mutex;
 use project::{ProjectPath, git_store::branch_diff::DiffBase};
 use remote::{RemoteConnectionOptions, SshConnectionOptions, same_remote_connection_identity};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -24,8 +27,8 @@ use ui::{
     ListItemSpacing, Toggleable, Tooltip, prelude::*,
 };
 use vitermux::{
-    OpenPlanFailure, TmuxTreeSnapshot, TmuxWindow, VitermuxConnectionState, VitermuxStore,
-    ZedOpenPlan,
+    OpenPlanFailure, TmuxTreeSnapshot, TmuxWindow, VitermuxClient, VitermuxConnectionState,
+    VitermuxStore, ZedOpenPlan,
 };
 use workspace::{
     MultiWorkspace, OpenMode, Pane, PathList, Toast, Workspace,
@@ -36,6 +39,10 @@ use workspace::{
 const VITERMUX_PANEL_KEY: &str = "VitermuxPanel";
 const PROJECT_REPOSITORY_DISCOVERY_ATTEMPTS: usize = 60;
 const PROJECT_REPOSITORY_DISCOVERY_DELAY: Duration = Duration::from_millis(50);
+const REVIEW_COMPANION_SYNC_ATTEMPTS: usize = 60;
+const REVIEW_COMPANION_SYNC_DELAY: Duration = Duration::from_millis(50);
+const SESSION_SLOT_COUNT: usize = 9;
+const SESSION_SLOT_SCOPE_KEY: &str = "vitermux_session_slots";
 
 actions!(
     vitermux_panel,
@@ -47,6 +54,14 @@ actions!(
         OpenReviewSelected,
     ]
 );
+
+#[derive(Clone, Deserialize, PartialEq, JsonSchema, Action)]
+#[action(namespace = vitermux_panel)]
+pub struct ActivateSlot(pub usize);
+
+#[derive(Clone, Deserialize, PartialEq, JsonSchema, Action)]
+#[action(namespace = vitermux_panel)]
+pub struct AssignSelectedToSlot(pub usize);
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
@@ -73,6 +88,16 @@ pub fn init(cx: &mut App) {
                 panel.update(cx, |panel, cx| panel.open_selected_review(window, cx));
             }
         });
+        workspace.register_action(|workspace, action: &ActivateSlot, window, cx| {
+            if let Some(panel) = workspace.panel::<VitermuxPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.activate_slot(action, window, cx));
+            }
+        });
+        workspace.register_action(|workspace, action: &AssignSelectedToSlot, window, cx| {
+            if let Some(panel) = workspace.panel::<VitermuxPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.assign_selected_to_slot(action, window, cx));
+            }
+        });
     })
     .detach();
 }
@@ -92,6 +117,29 @@ struct WorkbenchRow {
     attention: SharedString,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionSlotAssignment {
+    session_key: String,
+    dedupe_key: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SerializedSessionSlotState {
+    #[serde(default = "session_slot_state_version")]
+    version: u8,
+    #[serde(default)]
+    slots: Vec<Option<SessionSlotAssignment>>,
+}
+
+impl Default for SerializedSessionSlotState {
+    fn default() -> Self {
+        Self {
+            version: session_slot_state_version(),
+            slots: empty_session_slots(),
+        }
+    }
+}
+
 #[derive(Clone)]
 enum DisplayRow {
     NodeHeader {
@@ -108,12 +156,20 @@ enum DisplayRow {
 
 pub struct VitermuxPanel {
     workspace: WeakEntity<Workspace>,
+    persistence_key: Option<String>,
     store: Entity<VitermuxStore>,
     focus_handle: FocusHandle,
     list_state: ListState,
     pending_open_keys: Arc<Mutex<HashSet<String>>>,
+    open_plan_cache: Arc<Mutex<HashMap<String, ZedOpenPlan>>>,
     rows: Vec<WorkbenchRow>,
     display_rows: Vec<DisplayRow>,
+    row_index_by_key: HashMap<String, usize>,
+    row_index_by_session_key: HashMap<String, usize>,
+    row_index_by_terminal_key: HashMap<String, usize>,
+    display_row_index_by_row_key: HashMap<String, usize>,
+    assigned_slot_by_row_key: HashMap<String, usize>,
+    session_slots: Vec<Option<SessionSlotAssignment>>,
     selected_row_key: Option<SharedString>,
     last_focused_terminal_key: Option<String>,
     review_companion_enabled: Arc<AtomicBool>,
@@ -128,12 +184,29 @@ impl VitermuxPanel {
         mut cx: AsyncWindowContext,
     ) -> Result<Entity<Self>> {
         let workspace_handle = workspace.clone();
-        workspace.update_in(&mut cx, |_workspace, window, cx| {
-            cx.new(|cx| Self::new(workspace_handle.clone(), window, cx))
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let persistence_key = workspace_persistence_key(workspace);
+            let session_slots = load_session_slots(persistence_key.as_deref(), cx)
+                .unwrap_or_else(empty_session_slots);
+            cx.new(|cx| {
+                Self::new(
+                    workspace_handle.clone(),
+                    persistence_key.clone(),
+                    session_slots.clone(),
+                    window,
+                    cx,
+                )
+            })
         })
     }
 
-    fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        workspace: WeakEntity<Workspace>,
+        persistence_key: Option<String>,
+        session_slots: Vec<Option<SessionSlotAssignment>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let store = VitermuxStore::global(cx);
         // The workbench inbox is operator-critical, so we prefer deterministic
         // far-jump selection reveal over cheaper visible-only measurement.
@@ -157,12 +230,20 @@ impl VitermuxPanel {
         }
         let mut this = Self {
             workspace,
+            persistence_key,
             store: store.clone(),
             focus_handle: cx.focus_handle(),
             list_state,
             pending_open_keys: Arc::default(),
+            open_plan_cache: Arc::default(),
             rows: Vec::new(),
             display_rows: Vec::new(),
+            row_index_by_key: HashMap::default(),
+            row_index_by_session_key: HashMap::default(),
+            row_index_by_terminal_key: HashMap::default(),
+            display_row_index_by_row_key: HashMap::default(),
+            assigned_slot_by_row_key: HashMap::default(),
+            session_slots,
             selected_row_key: None,
             last_focused_terminal_key: None,
             review_companion_enabled: review_companion_enabled_flag(),
@@ -188,7 +269,27 @@ impl VitermuxPanel {
             .cloned()
             .map(|snapshot| flatten_rows(&snapshot))
             .unwrap_or_default();
+        self.row_index_by_key = build_row_index_by_key(&self.rows);
+        self.row_index_by_session_key = build_row_index_by_session_key(&self.rows);
+        self.row_index_by_terminal_key = build_row_index_by_terminal_key(&self.rows);
+        let seeded_slots = self.maybe_seed_session_slots(cx);
+        self.assigned_slot_by_row_key = build_assigned_slot_by_row_key(
+            &self.session_slots,
+            &self.rows,
+            &self.row_index_by_session_key,
+            &self.row_index_by_terminal_key,
+        );
         self.display_rows = build_display_rows(&self.rows);
+        self.display_row_index_by_row_key = build_display_row_index_by_row_key(&self.display_rows);
+        prune_cached_open_plans(
+            &self.open_plan_cache,
+            &self.rows,
+            &self.row_index_by_session_key,
+            &self.row_index_by_terminal_key,
+        );
+        if seeded_slots {
+            cx.notify();
+        }
 
         if self.list_state.item_count() != self.display_rows.len() {
             self.list_state.reset(self.display_rows.len());
@@ -203,11 +304,10 @@ impl VitermuxPanel {
             return;
         }
 
-        let selected_exists = self.selected_row_key.as_ref().is_some_and(|selected| {
-            self.rows
-                .iter()
-                .any(|row| row.row_key.as_ref() == selected.as_ref())
-        });
+        let selected_exists = self
+            .selected_row_key
+            .as_ref()
+            .is_some_and(|selected| self.row_index_by_key.contains_key(selected.as_ref()));
         if !selected_exists {
             self.selected_row_key = self.rows.first().map(|row| row.row_key.clone());
         }
@@ -215,18 +315,24 @@ impl VitermuxPanel {
 
     fn selected_row(&self) -> Option<WorkbenchRow> {
         let selected = self.selected_row_key.as_ref()?;
-        self.rows
-            .iter()
+        self.row_index_by_key
+            .get(selected.as_ref())
+            .and_then(|index| self.rows.get(*index))
             .cloned()
-            .find(|row| row.row_key.as_ref() == selected.as_ref())
     }
 
     fn selected_row_index(&self) -> Option<usize> {
-        selected_row_index_in(&self.rows, self.selected_row_key.as_ref())
+        self.selected_row_key
+            .as_ref()
+            .and_then(|selected| self.row_index_by_key.get(selected.as_ref()).copied())
     }
 
     fn selected_display_row_index(&self) -> Option<usize> {
-        selected_display_row_index_in(&self.display_rows, self.selected_row_key.as_ref())
+        self.selected_row_key.as_ref().and_then(|selected| {
+            self.display_row_index_by_row_key
+                .get(selected.as_ref())
+                .copied()
+        })
     }
 
     fn scroll_selection_into_view(&self) {
@@ -255,6 +361,70 @@ impl VitermuxPanel {
     fn open_selected_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(row) = self.selected_row() {
             self.open_review_for_row(row, window, cx);
+        }
+    }
+
+    fn activate_slot(
+        &mut self,
+        action: &ActivateSlot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(slot_index) = normalize_slot_index(action.0) else {
+            return;
+        };
+        let Some(row) = self.resolve_slot_row(slot_index) else {
+            self.show_slot_toast(
+                format!(
+                    "Session slot {} is not currently available in the tmux topology",
+                    slot_number(slot_index)
+                ),
+                cx,
+            );
+            return;
+        };
+
+        self.selected_row_key = Some(row.row_key.clone());
+        self.scroll_selection_into_view();
+        cx.notify();
+        self.open_row(row, window, cx);
+    }
+
+    fn assign_selected_to_slot(
+        &mut self,
+        action: &AssignSelectedToSlot,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(slot_index) = normalize_slot_index(action.0) else {
+            return;
+        };
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        if row.session_key.is_none() {
+            self.show_slot_toast(
+                format!(
+                    "{} has no tracked agent session to assign",
+                    row.window_label.as_ref()
+                ),
+                cx,
+            );
+            return;
+        }
+
+        let changed = self.assign_row_to_slot(slot_index, &row);
+        if changed {
+            self.save_session_slots(cx);
+            self.show_slot_toast(
+                format!(
+                    "Assigned {} to session slot {}",
+                    row.window_label.as_ref(),
+                    slot_number(slot_index)
+                ),
+                cx,
+            );
+            cx.notify();
         }
     }
 
@@ -371,14 +541,118 @@ impl VitermuxPanel {
             .detach_and_prompt_err("Vitermux Review Open Failed", window, cx, |_, _, _| None);
     }
 
+    fn resolve_slot_row(&self, slot_index: usize) -> Option<WorkbenchRow> {
+        let slot = self.session_slots.get(slot_index)?.as_ref()?;
+        row_for_session_slot(
+            slot,
+            &self.rows,
+            &self.row_index_by_session_key,
+            &self.row_index_by_terminal_key,
+        )
+    }
+
+    fn assign_row_to_slot(&mut self, slot_index: usize, row: &WorkbenchRow) -> bool {
+        let Some(session_key) = row.session_key.as_ref() else {
+            return false;
+        };
+
+        if self.session_slots.len() != SESSION_SLOT_COUNT {
+            self.session_slots = normalize_session_slots(&self.session_slots);
+        }
+
+        let assignment = SessionSlotAssignment {
+            session_key: session_key.to_string(),
+            dedupe_key: row.dedupe_key.to_string(),
+        };
+        let already_assigned = self
+            .session_slots
+            .get(slot_index)
+            .and_then(|slot| slot.as_ref())
+            == Some(&assignment);
+        if already_assigned {
+            return false;
+        }
+
+        for slot in &mut self.session_slots {
+            if slot.as_ref().is_some_and(|existing| {
+                existing.session_key == assignment.session_key
+                    || existing.dedupe_key == assignment.dedupe_key
+            }) {
+                *slot = None;
+            }
+        }
+        self.session_slots[slot_index] = Some(assignment);
+        self.assigned_slot_by_row_key = build_assigned_slot_by_row_key(
+            &self.session_slots,
+            &self.rows,
+            &self.row_index_by_session_key,
+            &self.row_index_by_terminal_key,
+        );
+        true
+    }
+
+    fn maybe_seed_session_slots(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.session_slots.iter().any(Option::is_some) {
+            self.session_slots = normalize_session_slots(&self.session_slots);
+            return false;
+        }
+
+        let seeded_slots = seed_session_slots(&self.rows);
+        if seeded_slots.iter().all(Option::is_none) {
+            self.session_slots = seeded_slots;
+            return false;
+        }
+
+        self.session_slots = seeded_slots;
+        self.save_session_slots(cx);
+        true
+    }
+
+    fn save_session_slots(&self, cx: &mut Context<Self>) {
+        let Some(workspace_key) = self.persistence_key.clone() else {
+            return;
+        };
+
+        let kvp = KeyValueStore::global(cx);
+        let session_slots = self.session_slots.clone();
+        cx.background_spawn(async move {
+            let scope = kvp.scoped(SESSION_SLOT_SCOPE_KEY);
+            let state = SerializedSessionSlotState {
+                version: session_slot_state_version(),
+                slots: normalize_session_slots(&session_slots),
+            };
+            let Ok(json) = serde_json::to_string(&state) else {
+                return;
+            };
+            let _ = scope.write(workspace_key, json).await;
+        })
+        .detach();
+    }
+
+    fn show_slot_toast(&self, message: String, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_toast(
+                Toast::new(NotificationId::unique::<SessionSlotToast>(), message),
+                cx,
+            );
+        });
+    }
+
     fn sync_to_focused_terminal(
         &mut self,
         workspace: Entity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(focused_terminal) = focused_terminal_match(&self.rows, workspace.read(cx), cx)
-        else {
+        let Some(focused_terminal) = focused_terminal_match(
+            &self.rows,
+            &self.row_index_by_terminal_key,
+            workspace.read(cx),
+            cx,
+        ) else {
             return;
         };
         let terminal_key = focused_terminal.task_label.clone();
@@ -442,6 +716,7 @@ impl VitermuxPanel {
             return Task::ready(Ok(()));
         }
         let pending_open_keys = self.pending_open_keys.clone();
+        let open_plan_cache = self.open_plan_cache.clone();
         let requesting_window = window.window_handle().downcast::<MultiWorkspace>();
         let preferred_terminal_key = self.last_focused_terminal_key.clone();
         let review_companion_enabled = self.review_companion_enabled.load(Ordering::Acquire);
@@ -469,7 +744,13 @@ impl VitermuxPanel {
                 })?;
                 if did_focus_existing {
                     if review_companion_enabled {
-                        let plan = client.fetch_open_plan(&session_key).await?;
+                        let plan = fetch_open_plan_with_cache(
+                            &client,
+                            &open_plan_cache,
+                            &session_key,
+                            &row,
+                        )
+                        .await?;
                         if let Err(error) = sync_review_companion_for_terminal_open(
                             workspace.clone(),
                             &row,
@@ -485,7 +766,9 @@ impl VitermuxPanel {
                     return Ok(());
                 }
 
-                let plan = client.fetch_open_plan(&session_key).await?;
+                let plan =
+                    fetch_open_plan_with_cache(&client, &open_plan_cache, &session_key, &row)
+                        .await?;
                 let resolved_workspace = match resolve_project_workspace_for_plan(
                     workspace.clone(),
                     requesting_window.clone(),
@@ -607,6 +890,7 @@ impl VitermuxPanel {
             .workspace
             .upgrade()
             .ok_or_else(|| anyhow!("workspace is no longer available"));
+        let open_plan_cache = self.open_plan_cache.clone();
         let requesting_window = window.window_handle().downcast::<MultiWorkspace>();
         let session_key = row
             .session_key
@@ -617,7 +901,8 @@ impl VitermuxPanel {
         window.spawn(cx, async move |cx| {
             let workspace = workspace?;
             let session_key = session_key?;
-            let plan = client.fetch_open_plan(&session_key).await?;
+            let plan =
+                fetch_open_plan_with_cache(&client, &open_plan_cache, &session_key, &row).await?;
             if let Some(failure) = plan.failure.as_ref() {
                 return Err(open_plan_failure(failure));
             }
@@ -660,8 +945,9 @@ impl VitermuxPanel {
                     "daemon open plan did not resolve a project path for review"
                 ));
             };
-            workspace.update_in(cx, |workspace, window, cx| match mode {
+            match mode {
                 ReviewOpenMode::ExplicitOpen => {
+                    workspace.update_in(cx, |workspace, window, cx| {
                     let review_pane = terminal_pane_for_row(workspace, &row, cx)
                         .map(|terminal_pane| {
                             workspace.adjacent_pane_from(
@@ -683,27 +969,30 @@ impl VitermuxPanel {
                         window,
                         cx,
                     );
+                    })?;
                 }
                 ReviewOpenMode::SyncCompanion {
                     expected_terminal_key,
                     ensure_companion_pane,
                 } => {
-                    if focused_terminal_task_label(workspace, cx).as_deref()
-                        != Some(expected_terminal_key.as_str())
-                    {
-                        return;
+                    let still_focused = workspace.update_in(cx, |workspace, _window, cx| {
+                        focused_terminal_task_label(workspace, cx).as_deref()
+                            == Some(expected_terminal_key.as_str())
+                    })?;
+                    if !still_focused {
+                        return Ok(());
                     }
-                    deploy_review_companion_for_terminal_key(
-                        workspace,
+                    deploy_review_companion_until_synced(
+                        workspace.clone(),
                         &row,
                         project_path,
-                        expected_terminal_key.as_str(),
+                        expected_terminal_key,
                         ensure_companion_pane,
-                        window,
                         cx,
-                    );
+                    )
+                    .await?;
                 }
-            })?;
+            }
             Ok(())
         })
     }
@@ -751,6 +1040,11 @@ impl VitermuxPanel {
                 Label::new(state_text)
                     .size(LabelSize::XSmall)
                     .color(state_color),
+            )
+            .child(
+                Label::new("Cmd+1..9 switch sessions  •  Option+Cmd+1..9 assign selected")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
             )
             .when_some(store.last_error().cloned(), |this, error| {
                 this.child(
@@ -836,6 +1130,10 @@ impl VitermuxPanel {
                 let disabled = row.session_key.is_none();
                 let panel_focused = self.active && self.focus_handle.contains_focused(window, cx);
                 let show_review = review_available(&row);
+                let assigned_slot = self
+                    .assigned_slot_by_row_key
+                    .get(row.row_key.as_ref())
+                    .copied();
 
                 ListItem::new(row.row_key.clone())
                     .toggle_state(row_selected)
@@ -850,6 +1148,13 @@ impl VitermuxPanel {
                     .end_slot(
                         h_flex()
                             .gap_1()
+                            .when_some(assigned_slot, |this, slot_index| {
+                                this.child(
+                                    Label::new(format!("⌘{}", slot_number(slot_index)))
+                                        .size(LabelSize::XSmall)
+                                        .color(if disabled { Color::Disabled } else { Color::Muted }),
+                                )
+                            })
                             .when(show_review, |this| {
                                 this.child(
                                     IconButton::new(
@@ -986,6 +1291,7 @@ impl Panel for VitermuxPanel {
 }
 
 struct MissingSessionToast;
+struct SessionSlotToast;
 
 fn flatten_rows(snapshot: &TmuxTreeSnapshot) -> Vec<WorkbenchRow> {
     let mut rows = Vec::new();
@@ -1079,6 +1385,213 @@ fn build_display_rows(rows: &[WorkbenchRow]) -> Vec<DisplayRow> {
     }
 
     display_rows
+}
+
+fn session_slot_state_version() -> u8 {
+    1
+}
+
+fn empty_session_slots() -> Vec<Option<SessionSlotAssignment>> {
+    vec![None; SESSION_SLOT_COUNT]
+}
+
+fn normalize_slot_index(slot_index: usize) -> Option<usize> {
+    (slot_index < SESSION_SLOT_COUNT).then_some(slot_index)
+}
+
+fn slot_number(slot_index: usize) -> usize {
+    slot_index + 1
+}
+
+fn normalize_session_slots(
+    session_slots: &[Option<SessionSlotAssignment>],
+) -> Vec<Option<SessionSlotAssignment>> {
+    let mut normalized = session_slots
+        .iter()
+        .take(SESSION_SLOT_COUNT)
+        .cloned()
+        .collect::<Vec<_>>();
+    normalized.resize(SESSION_SLOT_COUNT, None);
+    normalized
+}
+
+fn build_row_index_by_key(rows: &[WorkbenchRow]) -> HashMap<String, usize> {
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| (row.row_key.to_string(), index))
+        .collect()
+}
+
+fn build_row_index_by_session_key(rows: &[WorkbenchRow]) -> HashMap<String, usize> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            row.session_key
+                .as_ref()
+                .map(|session_key| (session_key.to_string(), index))
+        })
+        .collect()
+}
+
+fn build_row_index_by_terminal_key(rows: &[WorkbenchRow]) -> HashMap<String, usize> {
+    let mut index_by_terminal_key = HashMap::default();
+    for (index, row) in rows.iter().enumerate() {
+        index_by_terminal_key.insert(row.row_key.to_string(), index);
+        index_by_terminal_key.insert(row.dedupe_key.to_string(), index);
+    }
+    index_by_terminal_key
+}
+
+fn build_display_row_index_by_row_key(display_rows: &[DisplayRow]) -> HashMap<String, usize> {
+    display_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| match row {
+            DisplayRow::Window(row) => Some((row.row_key.to_string(), index)),
+            DisplayRow::NodeHeader { .. } | DisplayRow::SessionHeader { .. } => None,
+        })
+        .collect()
+}
+
+fn seed_session_slots(rows: &[WorkbenchRow]) -> Vec<Option<SessionSlotAssignment>> {
+    let mut session_slots = empty_session_slots();
+    for (slot_index, row) in rows
+        .iter()
+        .filter(|row| row.session_key.is_some())
+        .take(SESSION_SLOT_COUNT)
+        .enumerate()
+    {
+        let Some(session_key) = row.session_key.as_ref() else {
+            continue;
+        };
+        session_slots[slot_index] = Some(SessionSlotAssignment {
+            session_key: session_key.to_string(),
+            dedupe_key: row.dedupe_key.to_string(),
+        });
+    }
+    session_slots
+}
+
+fn row_for_session_slot(
+    slot: &SessionSlotAssignment,
+    rows: &[WorkbenchRow],
+    row_index_by_session_key: &HashMap<String, usize>,
+    row_index_by_terminal_key: &HashMap<String, usize>,
+) -> Option<WorkbenchRow> {
+    row_index_by_session_key
+        .get(slot.session_key.as_str())
+        .and_then(|index| rows.get(*index))
+        .or_else(|| {
+            row_index_by_terminal_key
+                .get(slot.dedupe_key.as_str())
+                .and_then(|index| rows.get(*index))
+        })
+        .cloned()
+}
+
+fn build_assigned_slot_by_row_key(
+    session_slots: &[Option<SessionSlotAssignment>],
+    rows: &[WorkbenchRow],
+    row_index_by_session_key: &HashMap<String, usize>,
+    row_index_by_terminal_key: &HashMap<String, usize>,
+) -> HashMap<String, usize> {
+    session_slots
+        .iter()
+        .enumerate()
+        .filter_map(|(slot_index, slot)| {
+            let slot = slot.as_ref()?;
+            let row = row_for_session_slot(slot, rows, row_index_by_session_key, row_index_by_terminal_key)?;
+            Some((row.row_key.to_string(), slot_index))
+        })
+        .collect()
+}
+
+fn workspace_persistence_key(workspace: &Workspace) -> Option<String> {
+    workspace
+        .database_id()
+        .map(|id| i64::from(id).to_string())
+        .or_else(|| workspace.session_id())
+}
+
+fn load_session_slots(
+    workspace_key: Option<&str>,
+    cx: &App,
+) -> Option<Vec<Option<SessionSlotAssignment>>> {
+    let workspace_key = workspace_key?;
+    let kvp = KeyValueStore::global(cx);
+    let scope = kvp.scoped(SESSION_SLOT_SCOPE_KEY);
+    let state = scope
+        .read(workspace_key)
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<SerializedSessionSlotState>(&json).ok())?;
+    Some(normalize_session_slots(&state.slots))
+}
+
+fn cached_open_plan_matches_row(plan: &ZedOpenPlan, row: &WorkbenchRow) -> bool {
+    let dedupe_key = plan.attach.dedupe_key.trim();
+    dedupe_key.is_empty()
+        || dedupe_key == row.dedupe_key.as_ref()
+        || dedupe_key == row.row_key.as_ref()
+}
+
+fn cached_open_plan_for_session(
+    open_plan_cache: &Arc<Mutex<HashMap<String, ZedOpenPlan>>>,
+    session_key: &str,
+    row: &WorkbenchRow,
+) -> Option<ZedOpenPlan> {
+    open_plan_cache
+        .lock()
+        .get(session_key)
+        .filter(|plan| cached_open_plan_matches_row(plan, row))
+        .cloned()
+}
+
+fn store_cached_open_plan(
+    open_plan_cache: &Arc<Mutex<HashMap<String, ZedOpenPlan>>>,
+    session_key: &str,
+    plan: &ZedOpenPlan,
+) {
+    if plan.failure.is_some() {
+        return;
+    }
+    open_plan_cache
+        .lock()
+        .insert(session_key.to_string(), plan.clone());
+}
+
+fn prune_cached_open_plans(
+    open_plan_cache: &Arc<Mutex<HashMap<String, ZedOpenPlan>>>,
+    rows: &[WorkbenchRow],
+    row_index_by_session_key: &HashMap<String, usize>,
+    row_index_by_terminal_key: &HashMap<String, usize>,
+) {
+    open_plan_cache.lock().retain(|session_key, plan| {
+        row_index_by_session_key
+            .get(session_key.as_str())
+            .and_then(|index| rows.get(*index))
+            .or_else(|| {
+                row_index_by_terminal_key
+                    .get(plan.attach.dedupe_key.as_str())
+                    .and_then(|index| rows.get(*index))
+            })
+            .is_some_and(|row| cached_open_plan_matches_row(plan, row))
+    });
+}
+
+async fn fetch_open_plan_with_cache(
+    client: &VitermuxClient,
+    open_plan_cache: &Arc<Mutex<HashMap<String, ZedOpenPlan>>>,
+    session_key: &str,
+    row: &WorkbenchRow,
+) -> Result<ZedOpenPlan> {
+    if let Some(plan) = cached_open_plan_for_session(open_plan_cache, session_key, row) {
+        return Ok(plan);
+    }
+
+    let plan = client.fetch_open_plan(session_key).await?;
+    store_cached_open_plan(open_plan_cache, session_key, &plan);
+    Ok(plan)
 }
 
 async fn ensure_project_workspace_for_plan(
@@ -1207,8 +1720,10 @@ async fn sync_workspace_project_context_for_plan(
             let _ = set_active_repository_for_project_path(workspace.clone(), &project_path, cx);
         }
         ProjectContextSyncMode::RequireGitRepository => {
-            wait_for_project_path_repository(workspace.clone(), &project_path, cx).await?;
+            let repository =
+                wait_for_project_path_repository(workspace.clone(), &project_path, cx).await?;
             set_active_repository_for_project_path(workspace.clone(), &project_path, cx)?;
+            wait_for_repository_barrier(repository, cx).await?;
         }
     }
 
@@ -1237,17 +1752,74 @@ async fn sync_review_companion_for_terminal_open(
         return Ok(());
     };
 
-    workspace.update_in(cx, |workspace, window, cx| {
-        deploy_review_companion_for_terminal_key(
-            workspace,
-            row,
-            project_path,
-            terminal_key,
-            false,
-            window,
-            cx,
-        );
-    })?;
+    deploy_review_companion_until_synced(
+        workspace,
+        row,
+        project_path,
+        terminal_key.to_string(),
+        false,
+        cx,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn deploy_review_companion_until_synced(
+    workspace: Entity<Workspace>,
+    row: &WorkbenchRow,
+    project_path: ProjectPath,
+    terminal_key: String,
+    ensure_companion_pane: bool,
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
+    let mut ensure_companion_pane = ensure_companion_pane;
+
+    for attempt in 0..=REVIEW_COMPANION_SYNC_ATTEMPTS {
+        let outcome = workspace.update_in(cx, |workspace, window, cx| {
+            if focused_terminal_task_label(workspace, cx).as_deref() != Some(terminal_key.as_str())
+            {
+                return ReviewCompanionSyncOutcome::StaleFocus;
+            }
+
+            deploy_review_companion_for_terminal_key(
+                workspace,
+                row,
+                project_path.clone(),
+                terminal_key.as_str(),
+                ensure_companion_pane,
+                window,
+                cx,
+            );
+
+            if review_companion_matches_terminal_worktree(
+                workspace,
+                terminal_key.as_str(),
+                &project_path,
+                cx,
+            ) {
+                ReviewCompanionSyncOutcome::Matched
+            } else {
+                ReviewCompanionSyncOutcome::RetryNeeded
+            }
+        })?;
+
+        match outcome {
+            ReviewCompanionSyncOutcome::Matched | ReviewCompanionSyncOutcome::StaleFocus => {
+                return Ok(());
+            }
+            ReviewCompanionSyncOutcome::RetryNeeded => {}
+        }
+
+        if attempt == REVIEW_COMPANION_SYNC_ATTEMPTS {
+            break;
+        }
+
+        ensure_companion_pane = false;
+        cx.background_executor()
+            .timer(REVIEW_COMPANION_SYNC_DELAY)
+            .await;
+    }
 
     Ok(())
 }
@@ -1299,14 +1871,22 @@ fn deploy_review_companion_for_terminal_key(
     }
 }
 
+enum ReviewCompanionSyncOutcome {
+    Matched,
+    RetryNeeded,
+    StaleFocus,
+}
+
 async fn wait_for_project_path_repository(
     workspace: Entity<Workspace>,
     project_path: &ProjectPath,
     cx: &mut AsyncWindowContext,
-) -> Result<()> {
+) -> Result<Entity<project::git_store::Repository>> {
     for attempt in 0..=PROJECT_REPOSITORY_DISCOVERY_ATTEMPTS {
-        if project_path_repository_is_ready(workspace.clone(), project_path, cx)? {
-            return Ok(());
+        if let Some(repository) =
+            project_path_repository(workspace.clone(), project_path, cx)?
+        {
+            return Ok(repository);
         }
 
         if attempt == PROJECT_REPOSITORY_DISCOVERY_ATTEMPTS {
@@ -1323,17 +1903,17 @@ async fn wait_for_project_path_repository(
     ))
 }
 
-fn project_path_repository_is_ready(
+fn project_path_repository(
     workspace: Entity<Workspace>,
     project_path: &ProjectPath,
     cx: &mut AsyncWindowContext,
-) -> Result<bool> {
+) -> Result<Option<Entity<project::git_store::Repository>>> {
     Ok(workspace.update(cx, |workspace, cx| {
         let git_store = workspace.project().read(cx).git_store().clone();
         git_store
             .read(cx)
             .repository_and_path_for_project_path(project_path, cx)
-            .is_some()
+            .map(|(repository, _)| repository.clone())
     }))
 }
 
@@ -1349,6 +1929,16 @@ fn set_active_repository_for_project_path(
         });
     });
     Ok(())
+}
+
+async fn wait_for_repository_barrier(
+    repository: Entity<project::git_store::Repository>,
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
+    let barrier = repository.update(cx, |repository, _| repository.barrier());
+    barrier
+        .await
+        .map_err(|_| anyhow!("repository barrier canceled"))
 }
 
 fn find_matching_workspace_in_window(
@@ -1589,6 +2179,7 @@ struct FocusedTerminalMatch {
 
 fn focused_terminal_match(
     rows: &[WorkbenchRow],
+    row_index_by_terminal_key: &HashMap<String, usize>,
     workspace: &Workspace,
     cx: &App,
 ) -> Option<FocusedTerminalMatch> {
@@ -1597,7 +2188,11 @@ fn focused_terminal_match(
     let terminal_view = active_item.act_as::<TerminalView>(cx)?;
     let task = terminal_view.read(cx).terminal().read(cx).task()?;
     let terminal_key = task.spawned_task.full_label.clone();
-    let row = row_for_terminal_task_label(rows, &terminal_key)?;
+    let row = row_index_by_terminal_key
+        .get(terminal_key.as_str())
+        .and_then(|index| rows.get(*index))
+        .cloned()
+        .or_else(|| row_for_terminal_task_label(rows, &terminal_key))?;
     Some(FocusedTerminalMatch {
         task_label: terminal_key,
         row,
@@ -1699,6 +2294,40 @@ fn pane_has_review_diff(pane: &Entity<Pane>, cx: &App) -> bool {
     pane.read(cx)
         .items_of_type::<ProjectDiff>()
         .any(|item| matches!(item.read(cx).diff_base(cx), DiffBase::Head))
+}
+
+fn review_companion_matches_terminal_worktree(
+    workspace: &mut Workspace,
+    terminal_key: &str,
+    project_path: &ProjectPath,
+    cx: &App,
+) -> bool {
+    let Some(terminal_pane) = terminal_pane_for_task_label(workspace, terminal_key, cx) else {
+        return false;
+    };
+    let Some(review_pane) =
+        find_review_diff_pane_for_terminal_in_workspace(workspace, &terminal_pane, cx)
+    else {
+        return false;
+    };
+    review_pane
+        .read(cx)
+        .items_of_type::<ProjectDiff>()
+        .find(|item| matches!(item.read(cx).diff_base(cx), DiffBase::Head))
+        .and_then(|item| item.read(cx).active_path(cx))
+        .is_some_and(|active_project_path| {
+            active_project_path.worktree_id == project_path.worktree_id
+        })
+}
+
+fn find_review_diff_pane_for_terminal_in_workspace(
+    workspace: &mut Workspace,
+    terminal_pane: &Entity<Pane>,
+    cx: &App,
+) -> Option<Entity<Pane>> {
+    let review_pane =
+        workspace.pane_in_direction_from(terminal_pane, workspace::SplitDirection::Right, cx)?;
+    pane_has_review_diff(&review_pane, cx).then_some(review_pane)
 }
 
 fn window_label(window: &TmuxWindow) -> String {
@@ -1816,12 +2445,14 @@ fn first_non_empty<'a>(values: impl IntoIterator<Item = &'a str>) -> &'a str {
         .unwrap_or("")
 }
 
+#[cfg(test)]
 fn selected_row_index_in(rows: &[WorkbenchRow], selected: Option<&SharedString>) -> Option<usize> {
     let selected = selected?;
     rows.iter()
         .position(|row| row.row_key.as_ref() == selected.as_ref())
 }
 
+#[cfg(test)]
 fn selected_display_row_index_in(
     display_rows: &[DisplayRow],
     selected: Option<&SharedString>,
@@ -1837,10 +2468,10 @@ fn selected_display_row_index_in(
 mod tests {
     use super::*;
     use fs::FakeFs;
-    use gpui::TestAppContext;
+    use gpui::{KeyContext, Keystroke, TestAppContext};
     use project::Project;
     use serde_json::json;
-    use settings::SettingsStore;
+    use settings::{KeymapFile, SettingsStore};
     use task::TaskId;
     use terminal_view::terminal_panel::TerminalPanel;
     use util::{path, rel_path::rel_path};
@@ -2019,6 +2650,186 @@ mod tests {
             row.dedupe_key
         );
         assert!(row_for_terminal_task_label(&rows, "missing").is_none());
+    }
+
+    #[test]
+    fn seed_session_slots_uses_first_trackable_rows_in_order() {
+        let rows = vec![
+            WorkbenchRow {
+                row_key: SharedString::from("untracked"),
+                session_key: None,
+                ..sample_row()
+            },
+            WorkbenchRow {
+                row_key: SharedString::from("row-1"),
+                session_key: Some(SharedString::from("session-1")),
+                dedupe_key: SharedString::from("dedupe-1"),
+                ..sample_row()
+            },
+            WorkbenchRow {
+                row_key: SharedString::from("row-2"),
+                session_key: Some(SharedString::from("session-2")),
+                dedupe_key: SharedString::from("dedupe-2"),
+                ..sample_row()
+            },
+        ];
+
+        let slots = seed_session_slots(&rows);
+
+        assert_eq!(slots.len(), SESSION_SLOT_COUNT);
+        assert_eq!(
+            slots[0].as_ref().map(|slot| (slot.session_key.as_str(), slot.dedupe_key.as_str())),
+            Some(("session-1", "dedupe-1"))
+        );
+        assert_eq!(
+            slots[1].as_ref().map(|slot| (slot.session_key.as_str(), slot.dedupe_key.as_str())),
+            Some(("session-2", "dedupe-2"))
+        );
+        assert!(slots[2..].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn row_for_session_slot_prefers_session_key_then_dedupe_key() {
+        let rows = vec![
+            WorkbenchRow {
+                row_key: SharedString::from("row-1"),
+                session_key: Some(SharedString::from("session-1")),
+                dedupe_key: SharedString::from("dedupe-1"),
+                ..sample_row()
+            },
+            WorkbenchRow {
+                row_key: SharedString::from("row-2"),
+                session_key: Some(SharedString::from("session-2")),
+                dedupe_key: SharedString::from("dedupe-2"),
+                ..sample_row()
+            },
+        ];
+        let row_index_by_session_key = build_row_index_by_session_key(&rows);
+        let row_index_by_terminal_key = build_row_index_by_terminal_key(&rows);
+
+        let prefers_session_key = row_for_session_slot(
+            &SessionSlotAssignment {
+                session_key: "session-2".into(),
+                dedupe_key: "dedupe-missing".into(),
+            },
+            &rows,
+            &row_index_by_session_key,
+            &row_index_by_terminal_key,
+        )
+        .expect("slot should resolve by session key");
+        assert_eq!(prefers_session_key.row_key.as_ref(), "row-2");
+
+        let falls_back_to_dedupe = row_for_session_slot(
+            &SessionSlotAssignment {
+                session_key: "session-missing".into(),
+                dedupe_key: "dedupe-1".into(),
+            },
+            &rows,
+            &row_index_by_session_key,
+            &row_index_by_terminal_key,
+        )
+        .expect("slot should resolve by dedupe key");
+        assert_eq!(falls_back_to_dedupe.row_key.as_ref(), "row-1");
+    }
+
+    #[test]
+    fn build_assigned_slot_by_row_key_marks_only_visible_slot_rows() {
+        let rows = vec![
+            WorkbenchRow {
+                row_key: SharedString::from("row-1"),
+                session_key: Some(SharedString::from("session-1")),
+                dedupe_key: SharedString::from("dedupe-1"),
+                ..sample_row()
+            },
+            WorkbenchRow {
+                row_key: SharedString::from("row-2"),
+                session_key: Some(SharedString::from("session-2")),
+                dedupe_key: SharedString::from("dedupe-2"),
+                ..sample_row()
+            },
+        ];
+        let row_index_by_session_key = build_row_index_by_session_key(&rows);
+        let row_index_by_terminal_key = build_row_index_by_terminal_key(&rows);
+        let slots = vec![
+            Some(SessionSlotAssignment {
+                session_key: "session-2".into(),
+                dedupe_key: "dedupe-2".into(),
+            }),
+            Some(SessionSlotAssignment {
+                session_key: "session-missing".into(),
+                dedupe_key: "dedupe-missing".into(),
+            }),
+        ];
+
+        let assigned = build_assigned_slot_by_row_key(
+            &slots,
+            &rows,
+            &row_index_by_session_key,
+            &row_index_by_terminal_key,
+        );
+
+        assert_eq!(assigned.get("row-2"), Some(&0));
+        assert!(!assigned.contains_key("row-1"));
+    }
+
+    #[gpui::test]
+    async fn session_slot_keymap_binds_in_vitermux_context(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project_a"), json!({ ".git": {} })).await;
+        let project = Project::test(fs, [path!("/project_a").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+        cx.update(|cx| {
+            cx.bind_keys(
+                KeymapFile::load_panic_on_failure(
+                    r#"[
+                        {
+                            "context": "Workspace && left_dock == VitermuxPanel",
+                            "bindings": {
+                                "cmd-2": ["vitermux_panel::ActivateSlot", 1]
+                            }
+                        },
+                        {
+                            "context": "VitermuxPanel",
+                            "bindings": {
+                                "alt-cmd-3": ["vitermux_panel::AssignSelectedToSlot", 2]
+                            }
+                        }
+                    ]"#,
+                    cx,
+                ),
+            );
+        });
+
+        let activate_slot_matches = window.update(cx, |_workspace, window, _cx| {
+            let binding = window
+                .highest_precedence_binding_for_action_in_context(
+                    &ActivateSlot(1),
+                    KeyContext::parse("Workspace left_dock=VitermuxPanel")
+                        .expect("key context should parse"),
+                )
+                .expect("activate slot binding should exist");
+            binding.match_keystrokes(&[Keystroke::parse("cmd-2").unwrap()])
+        })
+        .expect("window update should succeed");
+        assert_eq!(activate_slot_matches, Some(false));
+
+        let assign_slot_matches = window.update(cx, |_workspace, window, _cx| {
+            let binding = window
+                .highest_precedence_binding_for_action_in_context(
+                    &AssignSelectedToSlot(2),
+                    KeyContext::parse("VitermuxPanel").expect("key context should parse"),
+                )
+                .expect("assign slot binding should exist");
+            binding.match_keystrokes(&[Keystroke::parse("alt-cmd-3").unwrap()])
+        })
+        .expect("window update should succeed");
+        assert_eq!(assign_slot_matches, Some(false));
     }
 
     #[test]

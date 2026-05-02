@@ -19538,6 +19538,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collections",
+ "db",
  "editor",
  "fs",
  "git_ui",
@@ -19547,6 +19548,8 @@ dependencies = [
  "project",
  "remote",
  "remote_connection",
+ "schemars 1.0.4",
+ "serde",
  "serde_json",
  "settings",
  "task",
