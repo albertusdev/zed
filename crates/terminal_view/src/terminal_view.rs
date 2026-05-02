@@ -867,7 +867,7 @@ impl TerminalView {
         dispatch_context.add("Terminal");
 
         if self.terminal.read(cx).task().is_some_and(|task| {
-            task.spawned_task.full_label.starts_with("vitermux:")
+            is_vitermux_terminal_label(task.spawned_task.full_label.as_str())
         }) {
             dispatch_context.add("vitermux_terminal");
         }
@@ -981,6 +981,13 @@ impl TerminalView {
                 }),
         )
     }
+}
+
+fn is_vitermux_terminal_label(full_label: &str) -> bool {
+    full_label.starts_with("vitermux:")
+        || (full_label.starts_with("node:")
+            && full_label.contains("/sess:")
+            && full_label.contains("/win:"))
 }
 
 fn terminal_rerun_override(task: &TaskId) -> zed_actions::Rerun {
@@ -2061,6 +2068,17 @@ mod tests {
         }
         text.push(' ');
         text
+    }
+
+    #[test]
+    fn vitermux_terminal_label_matches_prefixed_and_dedupe_forms() {
+        assert!(is_vitermux_terminal_label(
+            "vitermux:node:macbook/acct:operator@macbook/sess:default:zed-tabs/win:index:1"
+        ));
+        assert!(is_vitermux_terminal_label(
+            "node:macbook/acct:operator@macbook/sess:default:zed-tabs/win:index:1"
+        ));
+        assert!(!is_vitermux_terminal_label("plain-terminal-label"));
     }
 
     fn assert_drop_writes_to_terminal(

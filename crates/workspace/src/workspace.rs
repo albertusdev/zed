@@ -1288,6 +1288,7 @@ pub enum Event {
     Activate,
     PanelAdded(AnyView),
     WorktreeCreationChanged,
+    KeyContextChanged,
 }
 
 #[derive(Debug, Clone)]
@@ -1398,6 +1399,7 @@ pub struct Workspace {
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
     active_worktree_creation: ActiveWorktreeCreation,
     deferred_save_items: Vec<Box<dyn WeakItemHandle>>,
+    extra_key_context: HashSet<String>,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -1830,6 +1832,7 @@ impl Workspace {
             open_in_dev_container: false,
             _dev_container_task: None,
             deferred_save_items: Vec::new(),
+            extra_key_context: HashSet::default(),
         }
     }
 
@@ -7042,6 +7045,9 @@ impl Workspace {
     pub fn key_context(&self, cx: &App) -> KeyContext {
         let mut context = KeyContext::new_with_defaults();
         context.add("Workspace");
+        for extra_context in &self.extra_key_context {
+            context.add(extra_context.as_str());
+        }
         context.set("keyboard_layout", cx.keyboard_layout().name().to_string());
         if let Some(status) = self
             .debugger_provider
@@ -7076,6 +7082,24 @@ impl Workspace {
         }
 
         context
+    }
+
+    pub fn set_extra_key_context(
+        &mut self,
+        key: impl Into<String>,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let key = key.into();
+        let changed = if enabled {
+            self.extra_key_context.insert(key)
+        } else {
+            self.extra_key_context.remove(&key)
+        };
+        if changed {
+            cx.emit(Event::KeyContextChanged);
+            cx.notify();
+        }
     }
 
     /// Multiworkspace uses this to add workspace action handling to itself

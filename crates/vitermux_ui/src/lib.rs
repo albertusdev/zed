@@ -43,6 +43,8 @@ const REVIEW_COMPANION_SYNC_ATTEMPTS: usize = 60;
 const REVIEW_COMPANION_SYNC_DELAY: Duration = Duration::from_millis(50);
 const SESSION_SLOT_COUNT: usize = 9;
 const SESSION_SLOT_SCOPE_KEY: &str = "vitermux_session_slots";
+const OPERATOR_WORKSPACE_SCOPE_KEY: &str = "vitermux_operator_workspace";
+const OPERATOR_WORKSPACE_CONTEXT_KEY: &str = "VitermuxOperatorWorkspace";
 
 actions!(
     vitermux_panel,
@@ -119,7 +121,11 @@ struct WorkbenchRow {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct SessionSlotAssignment {
+    #[serde(default)]
+    terminal_key: String,
+    #[serde(default)]
     session_key: String,
+    #[serde(default)]
     dedupe_key: String,
 }
 
@@ -140,6 +146,12 @@ impl Default for SerializedSessionSlotState {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SerializedOperatorWorkspaceState {
+    #[serde(default)]
+    enabled: bool,
+}
+
 #[derive(Clone)]
 enum DisplayRow {
     NodeHeader {
@@ -157,6 +169,7 @@ enum DisplayRow {
 pub struct VitermuxPanel {
     workspace: WeakEntity<Workspace>,
     persistence_key: Option<String>,
+    operator_workspace_enabled: bool,
     store: Entity<VitermuxStore>,
     focus_handle: FocusHandle,
     list_state: ListState,
@@ -186,12 +199,15 @@ impl VitermuxPanel {
         let workspace_handle = workspace.clone();
         workspace.update_in(&mut cx, |workspace, window, cx| {
             let persistence_key = workspace_persistence_key(workspace);
+            let operator_workspace_enabled =
+                load_operator_workspace_enabled(persistence_key.as_deref(), cx).unwrap_or(false);
             let session_slots = load_session_slots(persistence_key.as_deref(), cx)
                 .unwrap_or_else(empty_session_slots);
             cx.new(|cx| {
                 Self::new(
                     workspace_handle.clone(),
                     persistence_key.clone(),
+                    operator_workspace_enabled,
                     session_slots.clone(),
                     window,
                     cx,
@@ -203,6 +219,7 @@ impl VitermuxPanel {
     fn new(
         workspace: WeakEntity<Workspace>,
         persistence_key: Option<String>,
+        operator_workspace_enabled: bool,
         session_slots: Vec<Option<SessionSlotAssignment>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -231,6 +248,7 @@ impl VitermuxPanel {
         let mut this = Self {
             workspace,
             persistence_key,
+            operator_workspace_enabled,
             store: store.clone(),
             focus_handle: cx.focus_handle(),
             list_state,
@@ -254,6 +272,7 @@ impl VitermuxPanel {
         this.refresh_view_model(cx);
         this.ensure_selection(cx);
         this.scroll_selection_into_view();
+        this.defer_operator_workspace_context_sync(window, cx);
         this
     }
 
@@ -373,6 +392,14 @@ impl VitermuxPanel {
         let Some(slot_index) = normalize_slot_index(action.0) else {
             return;
         };
+        if !self.operator_workspace_enabled {
+            if self.focus_handle.contains_focused(window, cx) || self.last_focused_terminal_key.is_some() {
+                self.enable_operator_workspace_mode(window, cx);
+            } else {
+                window.dispatch_action(workspace::ActivatePane(slot_index).boxed_clone(), cx);
+                return;
+            }
+        }
         let Some(row) = self.resolve_slot_row(slot_index) else {
             self.show_slot_toast(
                 format!(
@@ -393,12 +420,13 @@ impl VitermuxPanel {
     fn assign_selected_to_slot(
         &mut self,
         action: &AssignSelectedToSlot,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(slot_index) = normalize_slot_index(action.0) else {
             return;
         };
+        self.enable_operator_workspace_mode(window, cx);
         let Some(row) = self.selected_row() else {
             return;
         };
@@ -500,6 +528,7 @@ impl VitermuxPanel {
     }
 
     fn open_row(&mut self, row: WorkbenchRow, window: &mut Window, cx: &mut Context<Self>) {
+        self.enable_operator_workspace_mode(window, cx);
         if row.session_key.is_none() {
             if let Some(workspace) = self.workspace.upgrade() {
                 workspace.update(cx, |workspace, cx| {
@@ -532,6 +561,7 @@ impl VitermuxPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.enable_operator_workspace_mode(window, cx);
         if row.session_key.is_none() {
             return;
         }
@@ -555,12 +585,12 @@ impl VitermuxPanel {
         let Some(session_key) = row.session_key.as_ref() else {
             return false;
         };
-
         if self.session_slots.len() != SESSION_SLOT_COUNT {
             self.session_slots = normalize_session_slots(&self.session_slots);
         }
 
         let assignment = SessionSlotAssignment {
+            terminal_key: row.row_key.to_string(),
             session_key: session_key.to_string(),
             dedupe_key: row.dedupe_key.to_string(),
         };
@@ -575,7 +605,7 @@ impl VitermuxPanel {
 
         for slot in &mut self.session_slots {
             if slot.as_ref().is_some_and(|existing| {
-                existing.session_key == assignment.session_key
+                existing.terminal_key == assignment.terminal_key
                     || existing.dedupe_key == assignment.dedupe_key
             }) {
                 *slot = None;
@@ -592,6 +622,10 @@ impl VitermuxPanel {
     }
 
     fn maybe_seed_session_slots(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.operator_workspace_enabled {
+            self.session_slots = normalize_session_slots(&self.session_slots);
+            return false;
+        }
         if self.session_slots.iter().any(Option::is_some) {
             self.session_slots = normalize_session_slots(&self.session_slots);
             return false;
@@ -621,6 +655,52 @@ impl VitermuxPanel {
                 version: session_slot_state_version(),
                 slots: normalize_session_slots(&session_slots),
             };
+            let Ok(json) = serde_json::to_string(&state) else {
+                return;
+            };
+            let _ = scope.write(workspace_key, json).await;
+        })
+        .detach();
+    }
+
+    fn enable_operator_workspace_mode(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.operator_workspace_enabled {
+            return;
+        }
+        self.operator_workspace_enabled = true;
+        self.defer_operator_workspace_context_sync(window, cx);
+        self.save_operator_workspace_mode(cx);
+        if self.maybe_seed_session_slots(cx) {
+            cx.notify();
+        }
+    }
+
+    fn defer_operator_workspace_context_sync(&mut self, window: &Window, cx: &mut Context<Self>) {
+        cx.defer_in(window, |_this, _window, cx| {
+            _this.sync_operator_workspace_context(cx);
+        });
+    }
+
+    fn sync_operator_workspace_context(&self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let enabled = self.operator_workspace_enabled;
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_extra_key_context(OPERATOR_WORKSPACE_CONTEXT_KEY, enabled, cx);
+        });
+    }
+
+    fn save_operator_workspace_mode(&self, cx: &mut Context<Self>) {
+        let Some(workspace_key) = self.persistence_key.clone() else {
+            return;
+        };
+
+        let kvp = KeyValueStore::global(cx);
+        let enabled = self.operator_workspace_enabled;
+        cx.background_spawn(async move {
+            let scope = kvp.scoped(OPERATOR_WORKSPACE_SCOPE_KEY);
+            let state = SerializedOperatorWorkspaceState { enabled };
             let Ok(json) = serde_json::to_string(&state) else {
                 return;
             };
@@ -666,6 +746,10 @@ impl VitermuxPanel {
             cx.notify();
         }
 
+        let same_terminal_key =
+            self.last_focused_terminal_key.as_deref() == Some(terminal_key.as_str());
+        self.last_focused_terminal_key = Some(terminal_key.clone());
+
         if !self.review_companion_enabled.load(Ordering::Acquire) {
             return;
         }
@@ -673,9 +757,6 @@ impl VitermuxPanel {
         let has_companion_for_terminal = workspace.update(cx, |workspace, cx| {
             find_review_diff_pane_for_terminal(workspace, &terminal_pane, cx).is_some()
         });
-        let same_terminal_key =
-            self.last_focused_terminal_key.as_deref() == Some(terminal_key.as_str());
-        self.last_focused_terminal_key = Some(terminal_key);
 
         if same_terminal_key && has_companion_for_terminal {
             return;
@@ -1042,7 +1123,12 @@ impl VitermuxPanel {
                     .color(state_color),
             )
             .child(
-                Label::new("Cmd+1..9 switch sessions  •  Option+Cmd+1..9 assign selected")
+                Label::new("Cmd+1..9 switch tmux tabs  •  Option+Cmd+1..9 assign selected")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new("Tmux windows are the switching primitive")
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
@@ -1461,11 +1547,13 @@ fn seed_session_slots(rows: &[WorkbenchRow]) -> Vec<Option<SessionSlotAssignment
         .take(SESSION_SLOT_COUNT)
         .enumerate()
     {
-        let Some(session_key) = row.session_key.as_ref() else {
-            continue;
-        };
         session_slots[slot_index] = Some(SessionSlotAssignment {
-            session_key: session_key.to_string(),
+            terminal_key: row.row_key.to_string(),
+            session_key: row
+                .session_key
+                .as_ref()
+                .map(|session_key| session_key.to_string())
+                .unwrap_or_default(),
             dedupe_key: row.dedupe_key.to_string(),
         });
     }
@@ -1478,9 +1566,14 @@ fn row_for_session_slot(
     row_index_by_session_key: &HashMap<String, usize>,
     row_index_by_terminal_key: &HashMap<String, usize>,
 ) -> Option<WorkbenchRow> {
-    row_index_by_session_key
-        .get(slot.session_key.as_str())
+    row_index_by_terminal_key
+        .get(slot.terminal_key.as_str())
         .and_then(|index| rows.get(*index))
+        .or_else(|| {
+            row_index_by_session_key
+                .get(slot.session_key.as_str())
+                .and_then(|index| rows.get(*index))
+        })
         .or_else(|| {
             row_index_by_terminal_key
                 .get(slot.dedupe_key.as_str())
@@ -1526,6 +1619,18 @@ fn load_session_slots(
         .flatten()
         .and_then(|json| serde_json::from_str::<SerializedSessionSlotState>(&json).ok())?;
     Some(normalize_session_slots(&state.slots))
+}
+
+fn load_operator_workspace_enabled(workspace_key: Option<&str>, cx: &App) -> Option<bool> {
+    let workspace_key = workspace_key?;
+    let kvp = KeyValueStore::global(cx);
+    let scope = kvp.scoped(OPERATOR_WORKSPACE_SCOPE_KEY);
+    let state = scope
+        .read(workspace_key)
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<SerializedOperatorWorkspaceState>(&json).ok())?;
+    Some(state.enabled)
 }
 
 fn cached_open_plan_matches_row(plan: &ZedOpenPlan, row: &WorkbenchRow) -> bool {
@@ -2468,10 +2573,10 @@ fn selected_display_row_index_in(
 mod tests {
     use super::*;
     use fs::FakeFs;
-    use gpui::{KeyContext, Keystroke, TestAppContext};
+    use gpui::{KeyBinding, TestAppContext};
     use project::Project;
     use serde_json::json;
-    use settings::{KeymapFile, SettingsStore};
+    use settings::SettingsStore;
     use task::TaskId;
     use terminal_view::terminal_panel::TerminalPanel;
     use util::{path, rel_path::rel_path};
@@ -2678,38 +2783,66 @@ mod tests {
 
         assert_eq!(slots.len(), SESSION_SLOT_COUNT);
         assert_eq!(
-            slots[0].as_ref().map(|slot| (slot.session_key.as_str(), slot.dedupe_key.as_str())),
-            Some(("session-1", "dedupe-1"))
+            slots[0].as_ref().map(|slot| (
+                slot.terminal_key.as_str(),
+                slot.session_key.as_str(),
+                slot.dedupe_key.as_str()
+            )),
+            Some(("row-1", "session-1", "dedupe-1"))
         );
         assert_eq!(
-            slots[1].as_ref().map(|slot| (slot.session_key.as_str(), slot.dedupe_key.as_str())),
-            Some(("session-2", "dedupe-2"))
+            slots[1].as_ref().map(|slot| (
+                slot.terminal_key.as_str(),
+                slot.session_key.as_str(),
+                slot.dedupe_key.as_str()
+            )),
+            Some(("row-2", "session-2", "dedupe-2"))
         );
         assert!(slots[2..].iter().all(Option::is_none));
     }
 
     #[test]
-    fn row_for_session_slot_prefers_session_key_then_dedupe_key() {
+    fn row_for_session_slot_prefers_terminal_key_then_session_key_then_dedupe_key() {
         let rows = vec![
             WorkbenchRow {
                 row_key: SharedString::from("row-1"),
-                session_key: Some(SharedString::from("session-1")),
+                session_key: Some(SharedString::from("session-shared")),
                 dedupe_key: SharedString::from("dedupe-1"),
                 ..sample_row()
             },
             WorkbenchRow {
                 row_key: SharedString::from("row-2"),
-                session_key: Some(SharedString::from("session-2")),
+                session_key: Some(SharedString::from("session-shared")),
                 dedupe_key: SharedString::from("dedupe-2"),
+                ..sample_row()
+            },
+            WorkbenchRow {
+                row_key: SharedString::from("row-3"),
+                session_key: Some(SharedString::from("session-3")),
+                dedupe_key: SharedString::from("dedupe-3"),
                 ..sample_row()
             },
         ];
         let row_index_by_session_key = build_row_index_by_session_key(&rows);
         let row_index_by_terminal_key = build_row_index_by_terminal_key(&rows);
 
-        let prefers_session_key = row_for_session_slot(
+        let prefers_terminal_key = row_for_session_slot(
             &SessionSlotAssignment {
-                session_key: "session-2".into(),
+                terminal_key: "row-1".into(),
+                session_key: "session-shared".into(),
+                dedupe_key: "dedupe-2".into(),
+            },
+            &rows,
+            &row_index_by_session_key,
+            &row_index_by_terminal_key,
+        )
+        .expect("slot should resolve by terminal key");
+        assert_eq!(prefers_terminal_key.row_key.as_ref(), "row-1");
+
+        let falls_back_to_session_key = row_for_session_slot(
+            &SessionSlotAssignment {
+                terminal_key: "missing".into(),
+                session_key: "session-3".into(),
                 dedupe_key: "dedupe-missing".into(),
             },
             &rows,
@@ -2717,19 +2850,20 @@ mod tests {
             &row_index_by_terminal_key,
         )
         .expect("slot should resolve by session key");
-        assert_eq!(prefers_session_key.row_key.as_ref(), "row-2");
+        assert_eq!(falls_back_to_session_key.row_key.as_ref(), "row-3");
 
         let falls_back_to_dedupe = row_for_session_slot(
             &SessionSlotAssignment {
+                terminal_key: "missing".into(),
                 session_key: "session-missing".into(),
-                dedupe_key: "dedupe-1".into(),
+                dedupe_key: "dedupe-2".into(),
             },
             &rows,
             &row_index_by_session_key,
             &row_index_by_terminal_key,
         )
         .expect("slot should resolve by dedupe key");
-        assert_eq!(falls_back_to_dedupe.row_key.as_ref(), "row-1");
+        assert_eq!(falls_back_to_dedupe.row_key.as_ref(), "row-2");
     }
 
     #[test]
@@ -2752,10 +2886,12 @@ mod tests {
         let row_index_by_terminal_key = build_row_index_by_terminal_key(&rows);
         let slots = vec![
             Some(SessionSlotAssignment {
+                terminal_key: "row-2".into(),
                 session_key: "session-2".into(),
                 dedupe_key: "dedupe-2".into(),
             }),
             Some(SessionSlotAssignment {
+                terminal_key: "row-missing".into(),
                 session_key: "session-missing".into(),
                 dedupe_key: "dedupe-missing".into(),
             }),
@@ -2772,76 +2908,20 @@ mod tests {
         assert!(!assigned.contains_key("row-1"));
     }
 
-    #[gpui::test]
-    async fn session_slot_keymap_binds_in_vitermux_context(
-        cx: &mut TestAppContext,
-    ) {
-        cx.executor().allow_parking();
-        init_test(cx);
+    #[test]
+    fn default_keymap_places_operator_workspace_slot_bindings_after_workspace_pane_bindings() {
+        let keymap = include_str!("../../../assets/keymaps/default-macos.json");
+        let pane_bindings = keymap
+            .find(r#""cmd-9": ["workspace::ActivatePane", 8]"#)
+            .expect("workspace pane bindings should exist");
+        let operator_bindings = keymap
+            .find(r#""context": "Workspace && VitermuxOperatorWorkspace""#)
+            .expect("operator workspace binding block should exist");
 
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/project_a"), json!({ ".git": {} })).await;
-        let project = Project::test(fs, [path!("/project_a").as_ref()], cx).await;
-        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
-
-        cx.update(|cx| {
-            cx.bind_keys(
-                KeymapFile::load_panic_on_failure(
-                    r#"[
-                        {
-                            "context": "VitermuxPanel || (Terminal && vitermux_terminal)",
-                            "bindings": {
-                                "cmd-2": ["vitermux_panel::ActivateSlot", 1]
-                            }
-                        },
-                        {
-                            "context": "VitermuxPanel",
-                            "bindings": {
-                                "alt-cmd-3": ["vitermux_panel::AssignSelectedToSlot", 2]
-                            }
-                        }
-                    ]"#,
-                    cx,
-                ),
-            );
-        });
-
-        let activate_slot_matches = window.update(cx, |_workspace, window, _cx| {
-            let binding = window
-                .highest_precedence_binding_for_action_in_context(
-                    &ActivateSlot(1),
-                    KeyContext::parse("Terminal vitermux_terminal")
-                        .expect("key context should parse"),
-                )
-                .expect("activate slot binding should exist");
-            binding.match_keystrokes(&[Keystroke::parse("cmd-2").unwrap()])
-        })
-        .expect("window update should succeed");
-        assert_eq!(activate_slot_matches, Some(false));
-
-        let activate_slot_from_panel_matches = window.update(cx, |_workspace, window, _cx| {
-            let binding = window
-                .highest_precedence_binding_for_action_in_context(
-                    &ActivateSlot(1),
-                    KeyContext::parse("VitermuxPanel").expect("key context should parse"),
-                )
-                .expect("activate slot binding should exist");
-            binding.match_keystrokes(&[Keystroke::parse("cmd-2").unwrap()])
-        })
-        .expect("window update should succeed");
-        assert_eq!(activate_slot_from_panel_matches, Some(false));
-
-        let assign_slot_matches = window.update(cx, |_workspace, window, _cx| {
-            let binding = window
-                .highest_precedence_binding_for_action_in_context(
-                    &AssignSelectedToSlot(2),
-                    KeyContext::parse("VitermuxPanel").expect("key context should parse"),
-                )
-                .expect("assign slot binding should exist");
-            binding.match_keystrokes(&[Keystroke::parse("alt-cmd-3").unwrap()])
-        })
-        .expect("window update should succeed");
-        assert_eq!(assign_slot_matches, Some(false));
+        assert!(
+            operator_bindings > pane_bindings,
+            "operator workspace slot bindings must come after plain workspace pane bindings"
+        );
     }
 
     #[test]
@@ -3167,6 +3247,183 @@ mod tests {
         assert!(has_review_diff, "review diff should be present");
     }
 
+    #[gpui::test]
+    async fn cmd_number_switches_between_existing_vitermux_terminals(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project_a"), json!({ ".git": {} })).await;
+        let project = Project::test(fs, [path!("/project_a").as_ref()], cx).await;
+
+        let (multi_workspace, window) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(window, |mw, _| mw.workspace().clone());
+
+        let persistence_key =
+            workspace.read_with(window, |workspace, _| workspace_persistence_key(workspace));
+        let panel = window.update(|window, cx| {
+            cx.new(|cx| {
+                VitermuxPanel::new(
+                    workspace.downgrade(),
+                    persistence_key.clone(),
+                    false,
+                    empty_session_slots(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        window.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_panel(panel.clone(), window, cx);
+                workspace.toggle_panel_focus::<VitermuxPanel>(window, cx);
+            })
+        });
+        window.run_until_parked();
+
+        let row_a = WorkbenchRow {
+            row_key: SharedString::from("node:local/acct:me/sess:zed-tabs/win:index:1"),
+            session_key: Some(SharedString::from("codex:local:me@macbook:slot-a")),
+            dedupe_key: SharedString::from("node:local/acct:me/sess:zed-tabs/win:index:1"),
+            window_label: SharedString::from("vitermux-zed-pristine-a"),
+            ..sample_row()
+        };
+        let row_b = WorkbenchRow {
+            row_key: SharedString::from("node:local/acct:me/sess:zed-tabs/win:index:2"),
+            session_key: Some(SharedString::from("codex:local:me@macbook:slot-b")),
+            dedupe_key: SharedString::from("node:local/acct:me/sess:zed-tabs/win:index:2"),
+            window_label: SharedString::from("vitermux-zed-pristine-b"),
+            ..sample_row()
+        };
+
+        window.update(|_, cx| {
+            cx.bind_keys([
+                KeyBinding::new("cmd-1", ActivateSlot(0), Some("Terminal && vitermux_terminal")),
+                KeyBinding::new("cmd-2", ActivateSlot(1), Some("Terminal && vitermux_terminal")),
+                KeyBinding::new(
+                    "cmd-1",
+                    ActivateSlot(0),
+                    Some("Workspace && VitermuxOperatorWorkspace"),
+                ),
+                KeyBinding::new(
+                    "cmd-2",
+                    ActivateSlot(1),
+                    Some("Workspace && VitermuxOperatorWorkspace"),
+                ),
+            ]);
+        });
+
+        let spawn_task_a = SpawnInTerminal {
+            id: TaskId(row_a.dedupe_key.to_string()),
+            full_label: row_a.dedupe_key.to_string(),
+            label: row_a.window_label.to_string(),
+            reveal: RevealStrategy::Always,
+            reveal_target: RevealTarget::Center,
+            hide: HideStrategy::Never,
+            ..SpawnInTerminal::default()
+        };
+        let spawn_task_b = SpawnInTerminal {
+            id: TaskId(row_b.dedupe_key.to_string()),
+            full_label: row_b.dedupe_key.to_string(),
+            label: row_b.window_label.to_string(),
+            reveal: RevealStrategy::Always,
+            reveal_target: RevealTarget::Center,
+            hide: HideStrategy::Never,
+            ..SpawnInTerminal::default()
+        };
+
+        for spawn_task in [spawn_task_a.clone(), spawn_task_b.clone()] {
+            window
+                .update(|window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        TerminalPanel::add_center_terminal(workspace, window, cx, {
+                            let spawn_task = spawn_task.clone();
+                            move |project, cx| project.create_terminal_task(spawn_task, cx)
+                        })
+                    })
+                })
+                .await
+                .expect("terminal creation should succeed");
+            window.run_until_parked();
+        }
+
+        panel.update(window, |panel, cx| {
+            panel.rows = vec![row_a.clone(), row_b.clone()];
+            panel.display_rows = build_display_rows(&panel.rows);
+            panel.selected_row_key = Some(row_a.row_key.clone());
+            panel.row_index_by_session_key = build_row_index_by_session_key(&panel.rows);
+            panel.row_index_by_terminal_key = build_row_index_by_terminal_key(&panel.rows);
+            panel.operator_workspace_enabled = false;
+            panel.session_slots = normalize_session_slots(&[
+                Some(SessionSlotAssignment {
+                    terminal_key: row_a.row_key.to_string(),
+                    session_key: row_a
+                        .session_key
+                        .as_ref()
+                        .expect("row a should have a session key")
+                        .to_string(),
+                    dedupe_key: row_a.dedupe_key.to_string(),
+                }),
+                Some(SessionSlotAssignment {
+                    terminal_key: row_b.row_key.to_string(),
+                    session_key: row_b
+                        .session_key
+                        .as_ref()
+                        .expect("row b should have a session key")
+                        .to_string(),
+                    dedupe_key: row_b.dedupe_key.to_string(),
+                }),
+            ]);
+            panel.assigned_slot_by_row_key = build_assigned_slot_by_row_key(
+                &panel.session_slots,
+                &panel.rows,
+                &panel.row_index_by_session_key,
+                &panel.row_index_by_terminal_key,
+            );
+            cx.notify();
+        });
+        window.run_until_parked();
+
+        window.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                let terminal_panel = workspace.panel::<TerminalPanel>(cx);
+                assert!(focus_existing_terminal(
+                    workspace,
+                    terminal_panel,
+                    row_a.dedupe_key.as_ref(),
+                    window,
+                    cx,
+                ));
+            })
+        });
+        window.run_until_parked();
+
+        let before =
+            workspace.read_with(window, |workspace, cx| focused_terminal_task_label(workspace, cx));
+        assert_eq!(before.as_deref(), Some(row_a.dedupe_key.as_ref()));
+
+        panel
+            .update_in(window, |panel, window, cx| {
+                panel.sync_to_focused_terminal(workspace.clone(), window, cx);
+            });
+        window.run_until_parked();
+
+        window.simulate_keystrokes("cmd-2");
+
+        let after =
+            workspace.read_with(window, |workspace, cx| focused_terminal_task_label(workspace, cx));
+        assert_eq!(after.as_deref(), Some(row_b.dedupe_key.as_ref()));
+
+        let selected_row_key = panel.read_with(window, |panel, _| panel.selected_row_key.clone());
+        assert_eq!(selected_row_key.as_deref(), Some(row_b.row_key.as_ref()));
+        let operator_workspace_enabled =
+            panel.read_with(window, |panel, _| panel.operator_workspace_enabled);
+        assert!(operator_workspace_enabled);
+    }
+
     fn sample_row() -> WorkbenchRow {
         WorkbenchRow {
             row_key: SharedString::from("row-key"),
@@ -3202,6 +3459,7 @@ mod tests {
             editor::init(cx);
             git_ui::init(cx);
             terminal_view::init(cx);
+            vitermux::init(cx);
             crate::init(cx);
         });
     }

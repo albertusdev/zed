@@ -800,6 +800,20 @@
     },
   },
   {
+    "context": "Workspace && VitermuxOperatorWorkspace",
+    "bindings": {
+      "cmd-1": ["vitermux_panel::ActivateSlot", 0],
+      "cmd-2": ["vitermux_panel::ActivateSlot", 1],
+      "cmd-3": ["vitermux_panel::ActivateSlot", 2],
+      "cmd-4": ["vitermux_panel::ActivateSlot", 3],
+      "cmd-5": ["vitermux_panel::ActivateSlot", 4],
+      "cmd-6": ["vitermux_panel::ActivateSlot", 5],
+      "cmd-7": ["vitermux_panel::ActivateSlot", 6],
+      "cmd-8": ["vitermux_panel::ActivateSlot", 7],
+      "cmd-9": ["vitermux_panel::ActivateSlot", 8]
+    }
+  },
+  {
     "context": "ThreadsSidebar",
     "use_key_equivalents": true,
     "bindings": {
