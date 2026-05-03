@@ -1673,6 +1673,13 @@ fn flatten_rows(snapshot: &TmuxTreeSnapshot) -> Vec<WorkbenchRow> {
                 ]);
 
                 for window in &session.windows {
+                    let Some(session_key) = window
+                        .primary_session_key()
+                        .filter(|session_key| !session_key.trim().is_empty())
+                    else {
+                        continue;
+                    };
+
                     rows.push(WorkbenchRow {
                         row_key: SharedString::from(window.stable_row_key().to_string()),
                         node_section_key: SharedString::from(format!(
@@ -1686,10 +1693,7 @@ fn flatten_rows(snapshot: &TmuxTreeSnapshot) -> Vec<WorkbenchRow> {
                         session_detail: SharedString::from(session_detail.clone()),
                         window_label: SharedString::from(window_label(window)),
                         window_detail: SharedString::from(window_detail(window)),
-                        session_key: window
-                            .primary_session_key()
-                            .filter(|session_key| !session_key.trim().is_empty())
-                            .map(|session_key| SharedString::from(session_key.to_string())),
+                        session_key: Some(SharedString::from(session_key.to_string())),
                         dedupe_key: SharedString::from(window.stable_row_key().to_string()),
                         attention: SharedString::from(window.attention.clone()),
                     });
@@ -3114,6 +3118,11 @@ mod tests {
                         windows: vec![TmuxWindow {
                             dedupe_key: "node:macbook/acct:albertusangga@macbook/sess:zed-tabs/win:index:1".into(),
                             window_name: "vitermux".into(),
+                            harness: vitermux::HarnessBinding {
+                                session_key: "codex:local:albertusangga@macbook:123".into(),
+                                provider: "codex".into(),
+                                ..Default::default()
+                            },
                             ..Default::default()
                         }],
                         ..Default::default()
@@ -3128,6 +3137,55 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].node_label.as_ref(), "albertusangga@macbook");
         assert!(rows[0].node_is_local);
+    }
+
+    #[test]
+    fn flatten_rows_skips_windows_without_bound_agent_session() {
+        let snapshot = TmuxTreeSnapshot {
+            self_node_id: "macbook".into(),
+            nodes: vec![vitermux::TmuxNode {
+                node_key: "macbook".into(),
+                node_id: "macbook".into(),
+                node_name: "MacBook".into(),
+                accounts: vec![vitermux::TmuxAccount {
+                    account_key: "albertusangga@macbook".into(),
+                    account_name: "Albertus".into(),
+                    account_user: "albertusangga".into(),
+                    sessions: vec![vitermux::TmuxSession {
+                        session_key: "zed-tabs".into(),
+                        session_name: "zed-tabs".into(),
+                        windows: vec![
+                            TmuxWindow {
+                                dedupe_key: "node:macbook/acct:albertusangga@macbook/sess:zed-tabs/win:index:1".into(),
+                                window_name: "tracked".into(),
+                                harness: vitermux::HarnessBinding {
+                                    session_key: "codex:local:albertusangga@macbook:tracked".into(),
+                                    provider: "codex".into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                            TmuxWindow {
+                                dedupe_key: "node:macbook/acct:albertusangga@macbook/sess:zed-tabs/win:index:2".into(),
+                                window_name: "unbound".into(),
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    }],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let rows = flatten_rows(&snapshot);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].window_label.as_ref(), "tracked");
+        assert_eq!(
+            rows[0].session_key.as_ref().map(|value| value.as_ref()),
+            Some("codex:local:albertusangga@macbook:tracked")
+        );
     }
 
     #[test]
