@@ -43,6 +43,7 @@ const REVIEW_COMPANION_SYNC_ATTEMPTS: usize = 60;
 const REVIEW_COMPANION_SYNC_DELAY: Duration = Duration::from_millis(50);
 const MUTATION_REFRESH_ATTEMPTS: usize = 3;
 const MUTATION_REFRESH_DELAY: Duration = Duration::from_millis(150);
+const PENDING_LABEL_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_SLOT_COUNT: usize = 9;
 const SESSION_SLOT_SCOPE_KEY: &str = "vitermux_session_slots";
 const OPERATOR_WORKSPACE_SCOPE_KEY: &str = "vitermux_operator_workspace";
@@ -59,6 +60,7 @@ actions!(
         OpenSelected,
         OpenReviewSelected,
         ToggleReviewCompanion,
+        CompleteSelected,
         RenameSelected,
     ]
 );
@@ -99,6 +101,11 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &ToggleReviewCompanion, window, cx| {
             if let Some(panel) = workspace.panel::<VitermuxPanel>(cx) {
                 panel.update(cx, |panel, cx| panel.toggle_review_companion(window, cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &CompleteSelected, window, cx| {
+            if let Some(panel) = workspace.panel::<VitermuxPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.complete_selected(window, cx));
             }
         });
         workspace.register_action(|workspace, _: &RenameSelected, window, cx| {
@@ -153,6 +160,11 @@ struct SessionRenameTarget {
     row_key: String,
     session_key: String,
     current_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingSessionLabel {
+    label: SharedString,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -239,7 +251,7 @@ pub struct VitermuxPanel {
     assigned_slot_by_row_key: HashMap<String, usize>,
     session_slots: Vec<Option<SessionSlotAssignment>>,
     collapsed_host_keys: HashSet<String>,
-    pending_session_labels: HashMap<String, SharedString>,
+    pending_session_labels: HashMap<String, PendingSessionLabel>,
     selected_row_key: Option<SharedString>,
     last_focused_terminal_key: Option<String>,
     review_companion_enabled: bool,
@@ -383,34 +395,7 @@ impl VitermuxPanel {
     }
 
     fn apply_pending_session_label_overlays(&mut self, rows: &mut [WorkbenchRow]) {
-        if self.pending_session_labels.is_empty() {
-            return;
-        }
-
-        let mut visible_sessions = HashSet::default();
-        let mut settled_sessions = Vec::new();
-        for row in rows {
-            let Some(session_key) = row.session_key.as_ref() else {
-                continue;
-            };
-            let session_key = session_key.to_string();
-            visible_sessions.insert(session_key.clone());
-
-            let Some(pending_label) = self.pending_session_labels.get(session_key.as_str()) else {
-                continue;
-            };
-            if row.window_label.as_ref() == pending_label.as_ref() {
-                settled_sessions.push(session_key);
-                continue;
-            }
-            row.window_label = pending_label.clone();
-        }
-
-        self.pending_session_labels
-            .retain(|session_key, _| visible_sessions.contains(session_key));
-        for session_key in settled_sessions {
-            self.pending_session_labels.remove(session_key.as_str());
-        }
+        apply_pending_label_overlays(rows, &mut self.pending_session_labels);
     }
 
     fn ensure_selection(&mut self, _cx: &mut Context<Self>) {
@@ -515,6 +500,18 @@ impl VitermuxPanel {
         if let Some(row) = self.selected_row() {
             self.open_review_for_row(row, window, cx);
         }
+    }
+
+    fn complete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.enable_operator_workspace_mode(window, cx);
+        let Some(target) = self.selected_rename_target() else {
+            self.show_slot_toast(
+                "Select a tracked Vitermux session to complete".to_string(),
+                cx,
+            );
+            return;
+        };
+        self.complete_session(target, cx);
     }
 
     fn rename_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1006,7 +1003,7 @@ impl VitermuxPanel {
                         .unwrap_or(trimmed_name.as_str())
                         .trim()
                         .to_string();
-                    this.apply_renamed_session_label(&target.session_key, &canonical_name, cx);
+                    this.apply_renamed_session_label(&target, &canonical_name, cx);
                     this.refresh_after_mutation(cx);
                     this.show_slot_toast(
                         format!("Renamed {} to {}", target.current_name, canonical_name),
@@ -1022,9 +1019,35 @@ impl VitermuxPanel {
         .detach();
     }
 
+    fn complete_session(&mut self, target: SessionRenameTarget, cx: &mut Context<Self>) {
+        let client = self.store.read(cx).client();
+        cx.spawn(async move |this, cx| {
+            let result = client.complete_session(&target.session_key).await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(response) => {
+                    this.apply_completed_session_attention(&target.row_key, cx);
+                    this.refresh_after_mutation(cx);
+                    let completed_name = response
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.canonical_name())
+                        .unwrap_or(target.current_name.as_str())
+                        .trim()
+                        .to_string();
+                    this.show_slot_toast(format!("Completed review for {}", completed_name), cx);
+                }
+                Err(error) => {
+                    this.refresh_after_mutation(cx);
+                    this.show_slot_toast(format!("Complete failed: {}", error), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
     fn apply_renamed_session_label(
         &mut self,
-        session_key: &str,
+        target: &SessionRenameTarget,
         canonical_name: &str,
         cx: &mut Context<Self>,
     ) {
@@ -1033,18 +1056,68 @@ impl VitermuxPanel {
         }
 
         self.pending_session_labels.insert(
-            session_key.to_string(),
-            SharedString::from(canonical_name.to_string()),
+            target.row_key.clone(),
+            PendingSessionLabel {
+                label: SharedString::from(canonical_name.to_string()),
+            },
         );
+        self.expire_pending_session_label(target.row_key.clone(), canonical_name.to_string(), cx);
         let mut changed = false;
         for row in &mut self.rows {
-            if row
-                .session_key
-                .as_ref()
-                .is_some_and(|value| value.as_ref() == session_key)
-                && row.window_label.as_ref() != canonical_name
+            if row.row_key.as_ref() == target.row_key && row.window_label.as_ref() != canonical_name
             {
                 row.window_label = SharedString::from(canonical_name.to_string());
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+
+        self.rebuild_display_rows();
+        self.ensure_selection(cx);
+        self.scroll_selection_into_view();
+        cx.notify();
+    }
+
+    fn expire_pending_session_label(
+        &self,
+        row_key: String,
+        expected_label: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PENDING_LABEL_TIMEOUT).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(pending_label) = this.pending_session_labels.get(row_key.as_str()) else {
+                    return;
+                };
+                if pending_label.label.as_ref() != expected_label {
+                    return;
+                }
+
+                this.pending_session_labels.remove(row_key.as_str());
+                this.refresh_view_model(cx);
+                this.ensure_selection(cx);
+                this.scroll_selection_into_view();
+                this.show_slot_toast(
+                    format!(
+                        "Rename did not settle for {}; showing live tmux label",
+                        expected_label
+                    ),
+                    cx,
+                );
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn apply_completed_session_attention(&mut self, row_key: &str, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for row in &mut self.rows {
+            if row.row_key.as_ref() == row_key && row.attention.as_ref() != "complete" {
+                row.attention = SharedString::from("complete");
                 changed = true;
             }
         }
@@ -1689,11 +1762,13 @@ impl VitermuxPanel {
                 let row_key = row.row_key.clone();
                 let row_clone = row.clone();
                 let review_row = row.clone();
+                let complete_row = row.clone();
                 let rename_row = row.clone();
                 let row_selected = self.selected_row_key.as_ref() == Some(&row.row_key);
                 let disabled = row.session_key.is_none();
                 let panel_focused = self.active && self.focus_handle.contains_focused(window, cx);
                 let show_review = review_available(&row);
+                let show_complete = show_review;
                 let assigned_slot = self
                     .assigned_slot_by_row_key
                     .get(row.row_key.as_ref())
@@ -1720,6 +1795,39 @@ impl VitermuxPanel {
                                         cx,
                                     )
                                     .disabled(disabled),
+                                )
+                            })
+                            .when(show_complete, |this| {
+                                this.child(
+                                    IconButton::new(
+                                        format!("complete:{}", row_key.as_ref()),
+                                        IconName::Check,
+                                    )
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Complete current review"))
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            let Some(target) = rename_target_for_row(&complete_row)
+                                            else {
+                                                this.show_slot_toast(
+                                                    format!(
+                                                        "{} has no tracked session to complete",
+                                                        complete_row.window_label.as_ref()
+                                                    ),
+                                                    cx,
+                                                );
+                                                return;
+                                            };
+                                            this.enable_operator_workspace_mode(window, cx);
+                                            this.ensure_host_expanded_for_row(&complete_row, cx);
+                                            this.selected_row_key =
+                                                Some(complete_row.row_key.clone());
+                                            this.scroll_selection_into_view();
+                                            this.complete_session(target, cx);
+                                            cx.notify();
+                                        },
+                                    )),
                                 )
                             })
                             .when(!disabled, |this| {
@@ -2105,6 +2213,36 @@ fn build_display_rows(
     }
 
     display_rows
+}
+
+fn apply_pending_label_overlays(
+    rows: &mut [WorkbenchRow],
+    pending_labels: &mut HashMap<String, PendingSessionLabel>,
+) {
+    if pending_labels.is_empty() {
+        return;
+    }
+
+    let mut visible_rows = HashSet::default();
+    let mut settled_rows = Vec::new();
+    for row in rows {
+        let row_key = row.row_key.to_string();
+        visible_rows.insert(row_key.clone());
+
+        let Some(pending_label) = pending_labels.get(row_key.as_str()) else {
+            continue;
+        };
+        if row.window_label.as_ref() == pending_label.label.as_ref() {
+            settled_rows.push(row_key);
+            continue;
+        }
+        row.window_label = pending_label.label.clone();
+    }
+
+    pending_labels.retain(|row_key, _| visible_rows.contains(row_key));
+    for row_key in settled_rows {
+        pending_labels.remove(row_key.as_str());
+    }
 }
 
 fn host_label(account: &vitermux::TmuxAccount, node_host: &str) -> String {
@@ -3258,6 +3396,7 @@ fn find_review_diff_pane_for_terminal_in_workspace(
 
 fn window_label(window: &TmuxWindow) -> String {
     first_non_empty([
+        primary_agent_name(window),
         window.binding.workspace_label.as_str(),
         window.window_name.as_str(),
         window.window_target.as_str(),
@@ -3265,6 +3404,30 @@ fn window_label(window: &TmuxWindow) -> String {
         window.window_key.as_str(),
     ])
     .to_string()
+}
+
+fn primary_agent_name(window: &TmuxWindow) -> &str {
+    let primary_session_key = window.primary_session_key().unwrap_or_default();
+    if !primary_session_key.is_empty() {
+        if let Some(agent_name) = window.agents.iter().find_map(|agent| {
+            let matches_primary = (!agent.session_key.trim().is_empty()
+                && agent.session_key.trim() == primary_session_key)
+                || (!agent.session_id.trim().is_empty()
+                    && agent.session_id.trim() == primary_session_key);
+            matches_primary
+                .then(|| agent.name.trim())
+                .filter(|name| !name.is_empty())
+        }) {
+            return agent_name;
+        }
+    }
+
+    window
+        .agents
+        .iter()
+        .map(|agent| agent.name.trim())
+        .find(|name| !name.is_empty())
+        .unwrap_or("")
 }
 
 fn window_detail(window: &TmuxWindow) -> String {
@@ -4757,6 +4920,100 @@ mod tests {
         assert_eq!(target.session_key, "codex:poros:albertus@poros:123");
         assert_eq!(target.current_name, "frontend-logging-cleanup");
         assert_eq!(target.row_key, "row-key");
+    }
+
+    #[test]
+    fn pending_label_overlays_apply_only_to_matching_row_key() {
+        let session_key = SharedString::from("claude:macbook:acct:shared");
+        let mut rows = vec![
+            WorkbenchRow {
+                row_key: SharedString::from("row-a"),
+                session_key: Some(session_key.clone()),
+                ..sample_row()
+            },
+            WorkbenchRow {
+                row_key: SharedString::from("row-b"),
+                session_key: Some(session_key),
+                window_label: SharedString::from("other-window"),
+                ..sample_row()
+            },
+        ];
+        let mut pending_labels = HashMap::default();
+        pending_labels.insert(
+            "row-a".to_string(),
+            PendingSessionLabel {
+                label: SharedString::from("renamed-window"),
+            },
+        );
+
+        apply_pending_label_overlays(&mut rows, &mut pending_labels);
+
+        assert_eq!(rows[0].window_label.as_ref(), "renamed-window");
+        assert_eq!(rows[1].window_label.as_ref(), "other-window");
+        assert!(
+            pending_labels.contains_key("row-a"),
+            "overlay should remain pending until the daemon tree converges"
+        );
+    }
+
+    #[test]
+    fn pending_label_overlay_clears_once_matching_row_settles() {
+        let mut rows = vec![WorkbenchRow {
+            row_key: SharedString::from("row-a"),
+            window_label: SharedString::from("renamed-window"),
+            ..sample_row()
+        }];
+        let mut pending_labels = HashMap::default();
+        pending_labels.insert(
+            "row-a".to_string(),
+            PendingSessionLabel {
+                label: SharedString::from("renamed-window"),
+            },
+        );
+
+        apply_pending_label_overlays(&mut rows, &mut pending_labels);
+
+        assert!(
+            pending_labels.is_empty(),
+            "settled row should clear the pending overlay"
+        );
+    }
+
+    #[test]
+    fn window_label_prefers_primary_agent_name_over_workspace_label() {
+        let window = TmuxWindow {
+            binding: vitermux::WorktreeBinding {
+                workspace_label: "workspace-label".into(),
+                ..Default::default()
+            },
+            harness: vitermux::HarnessBinding {
+                session_key: "claude:macbook:acct:primary".into(),
+                ..Default::default()
+            },
+            agents: vec![vitermux::AgentBinding {
+                session_key: "claude:macbook:acct:primary".into(),
+                name: "explicit-display-name".into(),
+                ..Default::default()
+            }],
+            window_name: "tmux-window-name".into(),
+            ..Default::default()
+        };
+
+        assert_eq!(window_label(&window), "explicit-display-name");
+    }
+
+    #[test]
+    fn window_label_falls_back_to_workspace_label_without_agent_name() {
+        let window = TmuxWindow {
+            binding: vitermux::WorktreeBinding {
+                workspace_label: "workspace-label".into(),
+                ..Default::default()
+            },
+            window_name: "tmux-window-name".into(),
+            ..Default::default()
+        };
+
+        assert_eq!(window_label(&window), "workspace-label");
     }
 
     fn sample_row() -> WorkbenchRow {
