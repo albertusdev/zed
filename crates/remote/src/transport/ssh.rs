@@ -14,7 +14,7 @@ use futures::{
 use gpui::{App, AppContext as _, AsyncApp, Task};
 use parking_lot::Mutex;
 use paths::remote_server_dir_relative;
-use release_channel::{AppVersion, ReleaseChannel};
+use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use rpc::proto::Envelope;
 use semver::Version;
 pub use settings::SshPortForwardOption;
@@ -772,10 +772,15 @@ impl SshRemoteConnection {
             ssh_default_system_shell,
         };
 
-        let (release_channel, version) =
-            cx.update(|cx| (ReleaseChannel::global(cx), AppVersion::global(cx)));
+        let (release_channel, version, commit) = cx.update(|cx| {
+            (
+                ReleaseChannel::global(cx),
+                AppVersion::global(cx),
+                AppCommitSha::try_global(cx),
+            )
+        });
         this.remote_binary_path = Some(
-            this.ensure_server_binary(&delegate, release_channel, version, cx)
+            this.ensure_server_binary(&delegate, release_channel, version, commit, cx)
                 .await?,
         );
 
@@ -787,6 +792,7 @@ impl SshRemoteConnection {
         delegate: &Arc<dyn RemoteClientDelegate>,
         release_channel: ReleaseChannel,
         version: Version,
+        commit: Option<AppCommitSha>,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
         let version_str = match release_channel {
@@ -806,7 +812,7 @@ impl SshRemoteConnection {
         let dst_path =
             paths::remote_server_dir_relative().join(RelPath::unix(&binary_name).unwrap());
 
-        let binary_exists_on_server = self
+        let remote_server_version = self
             .socket
             .run_command(
                 self.ssh_shell_kind,
@@ -815,12 +821,16 @@ impl SshRemoteConnection {
                 true,
             )
             .await
-            .is_ok();
+            .ok();
+        let binary_exists_on_server = remote_server_version.is_some();
 
         #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
         if let Some(remote_server_path) = super::build_remote_server_from_source(
             &self.ssh_platform,
             delegate.as_ref(),
+            release_channel,
+            remote_server_version.as_deref(),
+            commit.as_ref(),
             binary_exists_on_server,
             cx,
         )

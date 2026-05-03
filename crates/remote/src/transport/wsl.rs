@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use collections::HashMap;
 use futures::channel::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
 use gpui::{App, AppContext as _, AsyncApp, Task};
-use release_channel::{AppVersion, ReleaseChannel};
+use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use rpc::proto::Envelope;
 use semver::Version;
 use smol::fs;
@@ -103,8 +103,9 @@ impl WslRemoteConnection {
             .await
             .context("failed detecting platform")?;
         log::info!("Remote platform discovered: {:?}", this.platform);
+        let commit = cx.update(|cx| AppCommitSha::try_global(cx));
         this.remote_binary_path = Some(
-            this.ensure_server_binary(&delegate, release_channel, version, cx)
+            this.ensure_server_binary(&delegate, release_channel, version, commit, cx)
                 .await
                 .context("failed ensuring server binary")?,
         );
@@ -171,6 +172,7 @@ impl WslRemoteConnection {
         delegate: &Arc<dyn RemoteClientDelegate>,
         release_channel: ReleaseChannel,
         version: Version,
+        commit: Option<AppCommitSha>,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
         let version_str = match release_channel {
@@ -195,15 +197,19 @@ impl WslRemoteConnection {
                 .map_err(|e| anyhow!("Failed to create directory: {}", e))?;
         }
 
-        let binary_exists_on_server = self
-            .run_wsl_command(&dst_path.display(PathStyle::Posix), &["version"])
+        let remote_server_version = self
+            .run_wsl_command_with_output(&dst_path.display(PathStyle::Posix), &["version"])
             .await
-            .is_ok();
+            .ok();
+        let binary_exists_on_server = remote_server_version.is_some();
 
         #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
         if let Some(remote_server_path) = super::build_remote_server_from_source(
             &self.platform,
             delegate.as_ref(),
+            release_channel,
+            remote_server_version.as_deref(),
+            commit.as_ref(),
             binary_exists_on_server,
             cx,
         )

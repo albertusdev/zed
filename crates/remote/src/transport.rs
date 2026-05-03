@@ -11,6 +11,8 @@ use futures::{
     channel::mpsc::{Sender, UnboundedReceiver, UnboundedSender},
 };
 use gpui::{AppContext as _, AsyncApp, Task};
+#[cfg(any(test, debug_assertions, feature = "build-remote-server-binary"))]
+use release_channel::{AppCommitSha, ReleaseChannel};
 use rpc::proto::Envelope;
 use util::command::Child;
 
@@ -185,6 +187,9 @@ fn handle_rpc_messages_over_child_process_stdio(
 async fn build_remote_server_from_source(
     platform: &crate::RemotePlatform,
     delegate: &dyn crate::RemoteClientDelegate,
+    release_channel: ReleaseChannel,
+    remote_server_version: Option<&str>,
+    app_commit_sha: Option<&AppCommitSha>,
     binary_exists_on_server: bool,
     cx: &mut AsyncApp,
 ) -> Result<Option<std::path::PathBuf>> {
@@ -216,6 +221,17 @@ async fn build_remote_server_from_source(
             return Ok(None);
         }
         log::warn!("ZED_BUILD_REMOTE_SERVER is disabled, but no server binary exists on the server")
+    }
+
+    if remote_server_version_matches_local_build(
+        release_channel,
+        remote_server_version,
+        app_commit_sha,
+    ) {
+        log::info!(
+            "reusing existing remote server binary built from source; remote version matches local build"
+        );
+        return Ok(None);
     }
 
     async fn run_cmd(command: &mut Command) -> Result<()> {
@@ -392,6 +408,39 @@ async fn build_remote_server_from_source(
     Ok(Some(path))
 }
 
+#[cfg(any(test, debug_assertions, feature = "build-remote-server-binary"))]
+fn remote_server_version_matches_local_build(
+    release_channel: ReleaseChannel,
+    remote_server_version: Option<&str>,
+    app_commit_sha: Option<&AppCommitSha>,
+) -> bool {
+    let Some(expected_version) =
+        expected_remote_server_build_version(release_channel, app_commit_sha)
+    else {
+        return false;
+    };
+
+    remote_server_version.map(str::trim) == Some(expected_version.as_str())
+}
+
+#[cfg(any(test, debug_assertions, feature = "build-remote-server-binary"))]
+fn expected_remote_server_build_version(
+    release_channel: ReleaseChannel,
+    app_commit_sha: Option<&AppCommitSha>,
+) -> Option<String> {
+    match release_channel {
+        ReleaseChannel::Dev | ReleaseChannel::Nightly => {
+            let commit_sha = app_commit_sha?.full();
+            Some(if let Some(build_id) = option_env!("ZED_BUILD_ID") {
+                format!("{build_id}+{commit_sha}")
+            } else {
+                commit_sha
+            })
+        }
+        ReleaseChannel::Preview | ReleaseChannel::Stable => None,
+    }
+}
+
 #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
 fn apply_path_env(command: &mut util::command::Command, path: Option<&str>) {
     if let Some(path) = path {
@@ -465,6 +514,7 @@ async fn which(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use release_channel::{AppCommitSha, ReleaseChannel};
 
     #[test]
     fn test_parse_platform() {
@@ -528,5 +578,29 @@ mod tests {
         );
         assert_eq!(parse_shell("", "sh"), "sh");
         assert_eq!(parse_shell("\n", "sh"), "sh");
+    }
+
+    #[test]
+    fn test_remote_server_version_matches_local_dev_build() {
+        let commit = AppCommitSha::new("deadbeefcafebabe".to_string());
+        assert!(remote_server_version_matches_local_build(
+            ReleaseChannel::Dev,
+            Some("deadbeefcafebabe"),
+            Some(&commit),
+        ));
+        assert!(!remote_server_version_matches_local_build(
+            ReleaseChannel::Dev,
+            Some("feedfacecafebabe"),
+            Some(&commit),
+        ));
+    }
+
+    #[test]
+    fn test_remote_server_version_requires_commit_identity_for_dev_builds() {
+        assert!(!remote_server_version_matches_local_build(
+            ReleaseChannel::Dev,
+            Some("deadbeefcafebabe"),
+            None,
+        ));
     }
 }

@@ -186,7 +186,7 @@ impl DockerExecConnection {
 
         let version_str = match release_channel {
             ReleaseChannel::Nightly => {
-                let commit = commit.map(|s| s.full()).unwrap_or_default();
+                let commit = commit.as_ref().map(|s| s.full()).unwrap_or_default();
                 format!("{}-{}", version, commit)
             }
             ReleaseChannel::Dev => "build".to_string(),
@@ -200,7 +200,7 @@ impl DockerExecConnection {
         let dst_path =
             paths::remote_server_dir_relative().join(RelPath::unix(&binary_name).unwrap());
 
-        let binary_exists_on_server = self
+        let remote_server_version = self
             .run_docker_exec(
                 &dst_path.display(self.path_style()),
                 Some(&remote_dir_for_server),
@@ -208,11 +208,15 @@ impl DockerExecConnection {
                 &["version"],
             )
             .await
-            .is_ok();
+            .ok();
+        let binary_exists_on_server = remote_server_version.is_some();
         #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
         if let Some(remote_server_path) = super::build_remote_server_from_source(
             &remote_platform,
             delegate.as_ref(),
+            release_channel,
+            remote_server_version.as_deref(),
+            commit.as_ref(),
             binary_exists_on_server,
             cx,
         )
