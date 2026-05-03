@@ -4170,22 +4170,32 @@ mod tests {
     }
 
     #[test]
-    fn default_keymap_binds_rename_selected_in_vitermux_panel() {
+    fn default_keymap_binds_rename_selected_in_vitermux_panel_and_terminal() {
         let keymap = include_str!("../../../assets/keymaps/default-macos.json");
         assert!(
-            keymap.contains(r#""context": "VitermuxPanel""#)
-                && keymap.contains(r#""cmd-shift-r": "vitermux_panel::RenameSelected""#),
-            "vitermux panel should expose a first-class rename shortcut"
+            keymap.contains(
+                r#"  {
+    "context": "VitermuxPanel || (Terminal && vitermux_terminal)",
+    "bindings": {
+      "alt-cmd-/": "vitermux_panel::ToggleReviewCompanion",
+      "cmd-shift-r": "vitermux_panel::RenameSelected","#,
+            ),
+            "vitermux panel and terminal contexts should expose a first-class rename shortcut"
         );
     }
 
     #[test]
-    fn default_linux_keymap_binds_rename_selected_in_vitermux_panel() {
+    fn default_linux_keymap_binds_rename_selected_in_vitermux_panel_and_terminal() {
         let keymap = include_str!("../../../assets/keymaps/default-linux.json");
         assert!(
-            keymap.contains(r#""context": "VitermuxPanel""#)
-                && keymap.contains(r#""cmd-shift-r": "vitermux_panel::RenameSelected""#),
-            "linux vitermux panel should expose a first-class rename shortcut"
+            keymap.contains(
+                r#"  {
+    "context": "VitermuxPanel || (Terminal && vitermux_terminal)",
+    "bindings": {
+      "alt-cmd-/": "vitermux_panel::ToggleReviewCompanion",
+      "cmd-shift-r": "vitermux_panel::RenameSelected","#,
+            ),
+            "linux vitermux panel and terminal contexts should expose a first-class rename shortcut"
         );
     }
 
