@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use db::kvp::KeyValueStore;
 use git_ui::project_diff::ProjectDiff;
 use gpui::{
@@ -22,8 +22,8 @@ use task::{
 };
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use ui::{
-    Color, Disableable, Icon, IconButton, IconName, IconSize, KeyBinding, Label, LabelSize,
-    ListItem, ListItemSpacing, Toggleable, Tooltip, prelude::*,
+    Color, Disableable, Disclosure, Icon, IconButton, IconName, IconSize, KeyBinding, Label,
+    LabelSize, ListItem, ListItemSpacing, Toggleable, Tooltip, prelude::*,
 };
 use vitermux::{
     OpenPlanFailure, TmuxTreeSnapshot, TmuxWindow, VitermuxClient, VitermuxConnectionState,
@@ -44,6 +44,7 @@ const SESSION_SLOT_COUNT: usize = 9;
 const SESSION_SLOT_SCOPE_KEY: &str = "vitermux_session_slots";
 const OPERATOR_WORKSPACE_SCOPE_KEY: &str = "vitermux_operator_workspace";
 const REVIEW_COMPANION_SCOPE_KEY: &str = "vitermux_review_companion";
+const COLLAPSED_HOST_SCOPE_KEY: &str = "vitermux_collapsed_hosts";
 const OPERATOR_WORKSPACE_CONTEXT_KEY: &str = "VitermuxOperatorWorkspace";
 
 actions!(
@@ -117,6 +118,7 @@ struct WorkbenchRow {
     row_key: SharedString,
     node_section_key: SharedString,
     node_label: SharedString,
+    node_is_local: bool,
     session_section_key: SharedString,
     session_label: SharedString,
     session_detail: SharedString,
@@ -174,6 +176,12 @@ impl Default for SerializedReviewCompanionState {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SerializedCollapsedHostState {
+    #[serde(default)]
+    host_keys: Vec<String>,
+}
+
 #[derive(Default)]
 struct OpenRequestTracker {
     next_request_id: u64,
@@ -182,9 +190,12 @@ struct OpenRequestTracker {
 
 #[derive(Clone)]
 enum DisplayRow {
-    NodeHeader {
+    HostHeader {
         row_key: SharedString,
+        host_key: SharedString,
         label: SharedString,
+        local_badge: bool,
+        collapsed: bool,
     },
     SessionHeader {
         row_key: SharedString,
@@ -211,6 +222,7 @@ pub struct VitermuxPanel {
     display_row_index_by_row_key: HashMap<String, usize>,
     assigned_slot_by_row_key: HashMap<String, usize>,
     session_slots: Vec<Option<SessionSlotAssignment>>,
+    collapsed_host_keys: HashSet<String>,
     selected_row_key: Option<SharedString>,
     last_focused_terminal_key: Option<String>,
     review_companion_enabled: bool,
@@ -234,6 +246,8 @@ impl VitermuxPanel {
                     .unwrap_or_else(default_review_companion_enabled);
             let session_slots = load_session_slots(persistence_key.as_deref(), cx)
                 .unwrap_or_else(empty_session_slots);
+            let collapsed_host_keys =
+                load_collapsed_host_keys(persistence_key.as_deref(), cx).unwrap_or_default();
             cx.new(|cx| {
                 Self::new(
                     workspace_handle.clone(),
@@ -241,6 +255,7 @@ impl VitermuxPanel {
                     operator_workspace_enabled,
                     review_companion_enabled,
                     session_slots.clone(),
+                    collapsed_host_keys.clone(),
                     window,
                     cx,
                 )
@@ -254,6 +269,7 @@ impl VitermuxPanel {
         operator_workspace_enabled: bool,
         review_companion_enabled: bool,
         session_slots: Vec<Option<SessionSlotAssignment>>,
+        collapsed_host_keys: HashSet<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -295,6 +311,7 @@ impl VitermuxPanel {
             display_row_index_by_row_key: HashMap::default(),
             assigned_slot_by_row_key: HashMap::default(),
             session_slots,
+            collapsed_host_keys,
             selected_row_key: None,
             last_focused_terminal_key: None,
             review_companion_enabled,
@@ -331,8 +348,7 @@ impl VitermuxPanel {
             &self.row_index_by_session_key,
             &self.row_index_by_terminal_key,
         );
-        self.display_rows = build_display_rows(&self.rows);
-        self.display_row_index_by_row_key = build_display_row_index_by_row_key(&self.display_rows);
+        self.rebuild_display_rows();
         prune_cached_open_plans(
             &self.open_plan_cache,
             &self.rows,
@@ -342,16 +358,11 @@ impl VitermuxPanel {
         if seeded_slots {
             cx.notify();
         }
-
-        if self.list_state.item_count() != self.display_rows.len() {
-            self.list_state.reset(self.display_rows.len());
-        } else {
-            self.list_state.remeasure();
-        }
     }
 
     fn ensure_selection(&mut self, _cx: &mut Context<Self>) {
-        if self.rows.is_empty() {
+        let visible_rows = self.visible_rows();
+        if visible_rows.is_empty() {
             self.selected_row_key = None;
             return;
         }
@@ -359,9 +370,13 @@ impl VitermuxPanel {
         let selected_exists = self
             .selected_row_key
             .as_ref()
-            .is_some_and(|selected| self.row_index_by_key.contains_key(selected.as_ref()));
+            .is_some_and(|selected| {
+                visible_rows
+                    .iter()
+                    .any(|row| row.row_key.as_ref() == selected.as_ref())
+            });
         if !selected_exists {
-            self.selected_row_key = self.rows.first().map(|row| row.row_key.clone());
+            self.selected_row_key = visible_rows.first().map(|row| row.row_key.clone());
         }
     }
 
@@ -373,18 +388,51 @@ impl VitermuxPanel {
             .cloned()
     }
 
-    fn selected_row_index(&self) -> Option<usize> {
-        self.selected_row_key
-            .as_ref()
-            .and_then(|selected| self.row_index_by_key.get(selected.as_ref()).copied())
-    }
-
     fn selected_display_row_index(&self) -> Option<usize> {
         self.selected_row_key.as_ref().and_then(|selected| {
             self.display_row_index_by_row_key
                 .get(selected.as_ref())
                 .copied()
         })
+    }
+
+    fn visible_rows(&self) -> Vec<WorkbenchRow> {
+        self.display_rows
+            .iter()
+            .filter_map(|row| match row {
+                DisplayRow::Window(row) => Some(row.clone()),
+                DisplayRow::HostHeader { .. } | DisplayRow::SessionHeader { .. } => None,
+            })
+            .collect()
+    }
+
+    fn rebuild_display_rows(&mut self) {
+        self.display_rows = build_display_rows(&self.rows, &self.collapsed_host_keys);
+        self.display_row_index_by_row_key = build_display_row_index_by_row_key(&self.display_rows);
+        if self.list_state.item_count() != self.display_rows.len() {
+            self.list_state.reset(self.display_rows.len());
+        } else {
+            self.list_state.remeasure();
+        }
+    }
+
+    fn ensure_host_expanded_for_row(&mut self, row: &WorkbenchRow, cx: &mut Context<Self>) {
+        if self.collapsed_host_keys.remove(row.node_section_key.as_ref()) {
+            self.save_collapsed_host_keys(cx);
+            self.rebuild_display_rows();
+        }
+    }
+
+    fn toggle_host_collapsed(&mut self, host_key: SharedString, cx: &mut Context<Self>) {
+        let host_key = host_key.to_string();
+        if !self.collapsed_host_keys.insert(host_key.clone()) {
+            self.collapsed_host_keys.remove(host_key.as_str());
+        }
+        self.save_collapsed_host_keys(cx);
+        self.rebuild_display_rows();
+        self.ensure_selection(cx);
+        self.scroll_selection_into_view();
+        cx.notify();
     }
 
     fn scroll_selection_into_view(&self) {
@@ -446,6 +494,7 @@ impl VitermuxPanel {
             return;
         };
 
+        self.ensure_host_expanded_for_row(&row, cx);
         self.selected_row_key = Some(row.row_key.clone());
         self.scroll_selection_into_view();
         cx.notify();
@@ -496,7 +545,7 @@ impl VitermuxPanel {
     }
 
     fn select_first(&mut self, _: &SelectFirst, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(row) = self.rows.first() {
+        if let Some(row) = self.visible_rows().first() {
             self.selected_row_key = Some(row.row_key.clone());
             self.scroll_selection_into_view();
             cx.notify();
@@ -504,7 +553,7 @@ impl VitermuxPanel {
     }
 
     fn select_last(&mut self, _: &SelectLast, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(row) = self.rows.last() {
+        if let Some(row) = self.visible_rows().last() {
             self.selected_row_key = Some(row.row_key.clone());
             self.scroll_selection_into_view();
             cx.notify();
@@ -512,17 +561,24 @@ impl VitermuxPanel {
     }
 
     fn select_next(&mut self, _: &SelectNext, window: &mut Window, cx: &mut Context<Self>) {
-        if self.rows.is_empty() {
+        let visible_rows = self.visible_rows();
+        if visible_rows.is_empty() {
             self.selected_row_key = None;
             cx.notify();
             return;
         }
 
         let next_index = self
-            .selected_row_index()
-            .map(|selected_index| (selected_index + 1) % self.rows.len())
+            .selected_row_key
+            .as_ref()
+            .and_then(|selected| {
+                visible_rows
+                    .iter()
+                    .position(|row| row.row_key.as_ref() == selected.as_ref())
+            })
+            .map(|selected_index| (selected_index + 1) % visible_rows.len())
             .unwrap_or(0);
-        self.selected_row_key = Some(self.rows[next_index].row_key.clone());
+        self.selected_row_key = Some(visible_rows[next_index].row_key.clone());
         self.scroll_selection_into_view();
 
         if !self.focus_handle.contains_focused(window, cx) {
@@ -532,23 +588,30 @@ impl VitermuxPanel {
     }
 
     fn select_previous(&mut self, _: &SelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
-        if self.rows.is_empty() {
+        let visible_rows = self.visible_rows();
+        if visible_rows.is_empty() {
             self.selected_row_key = None;
             cx.notify();
             return;
         }
 
         let previous_index = self
-            .selected_row_index()
+            .selected_row_key
+            .as_ref()
+            .and_then(|selected| {
+                visible_rows
+                    .iter()
+                    .position(|row| row.row_key.as_ref() == selected.as_ref())
+            })
             .map(|selected_index| {
                 if selected_index == 0 {
-                    self.rows.len() - 1
+                    visible_rows.len() - 1
                 } else {
                     selected_index - 1
                 }
             })
-            .unwrap_or(self.rows.len() - 1);
-        self.selected_row_key = Some(self.rows[previous_index].row_key.clone());
+            .unwrap_or(visible_rows.len() - 1);
+        self.selected_row_key = Some(visible_rows[previous_index].row_key.clone());
         self.scroll_selection_into_view();
 
         if !self.focus_handle.contains_focused(window, cx) {
@@ -558,6 +621,7 @@ impl VitermuxPanel {
     }
 
     fn select_and_open(&mut self, row: WorkbenchRow, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_host_expanded_for_row(&row, cx);
         self.selected_row_key = Some(row.row_key.clone());
         self.open_row(row, window, cx);
     }
@@ -776,6 +840,30 @@ impl VitermuxPanel {
         .detach();
     }
 
+    fn save_collapsed_host_keys(&self, cx: &mut Context<Self>) {
+        let Some(workspace_key) = self.persistence_key.clone() else {
+            return;
+        };
+
+        let kvp = KeyValueStore::global(cx);
+        let mut host_keys: Vec<String> = self.collapsed_host_keys.iter().cloned().collect();
+        host_keys.sort();
+        cx.background_spawn(async move {
+            let scope = kvp.scoped(COLLAPSED_HOST_SCOPE_KEY);
+            let state = SerializedCollapsedHostState {
+                host_keys: host_keys
+                    .into_iter()
+                    .filter(|host_key| !host_key.trim().is_empty())
+                    .collect(),
+            };
+            let Ok(json) = serde_json::to_string(&state) else {
+                return;
+            };
+            let _ = scope.write(workspace_key, json).await;
+        })
+        .detach();
+    }
+
     fn show_slot_toast(&self, message: String, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
@@ -806,6 +894,7 @@ impl VitermuxPanel {
         let row = focused_terminal.row;
         let terminal_pane = focused_terminal.pane;
 
+        self.ensure_host_expanded_for_row(&row, cx);
         if self.selected_row_key.as_ref().map(|value| value.as_ref()) != Some(row.row_key.as_ref())
         {
             self.selected_row_key = Some(row.row_key.clone());
@@ -1307,16 +1396,66 @@ impl VitermuxPanel {
         };
 
         match display_row {
-            DisplayRow::NodeHeader { row_key, label } => v_flex()
-                .id(row_key)
-                .pt_3()
-                .px_3()
-                .child(
-                    Label::new(label)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Accent),
-                )
-                .into_any_element(),
+            DisplayRow::HostHeader {
+                row_key,
+                host_key,
+                label,
+                local_badge,
+                collapsed,
+            } => {
+                let host_key_for_toggle = host_key.clone();
+                let host_key_for_click = host_key.clone();
+
+                h_flex()
+                    .id(row_key)
+                    .pt_3()
+                    .px_2()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        Disclosure::new(
+                            format!("vitermux-host-toggle-{}", host_key),
+                            !collapsed,
+                        )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_host_collapsed(host_key_for_toggle.clone(), cx);
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .id(format!("vitermux-host-label-{}", host_key))
+                            .w_full()
+                            .gap_2()
+                            .items_center()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                            .rounded_sm()
+                            .px_1()
+                            .py_0p5()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_host_collapsed(host_key_for_click.clone(), cx);
+                            }))
+                            .child(
+                                Label::new(label)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Accent),
+                            )
+                            .when(local_badge, |this| {
+                                this.child(
+                                    div()
+                                        .px_1p5()
+                                        .rounded_sm()
+                                        .bg(Color::Accent.color(cx).alpha(0.12))
+                                        .child(
+                                            Label::new("local")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Accent),
+                                        ),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            }
             DisplayRow::SessionHeader {
                 row_key,
                 label,
@@ -1512,27 +1651,18 @@ struct SessionSlotToast;
 
 fn flatten_rows(snapshot: &TmuxTreeSnapshot) -> Vec<WorkbenchRow> {
     let mut rows = Vec::new();
+    let self_node_id = snapshot.self_node_id.trim();
 
     for node in &snapshot.nodes {
-        let node_label = first_non_empty([
-            node.node_name.as_str(),
+        let node_host = first_non_empty([
             node.node_id.as_str(),
             node.node_key.as_str(),
+            node.node_name.as_str(),
         ]);
+        let node_is_local = !self_node_id.is_empty() && node.node_id.trim() == self_node_id;
 
         for account in &node.accounts {
-            let account_label = first_non_empty([
-                account.account_name.as_str(),
-                account.account_user.as_str(),
-                account.account_key.as_str(),
-            ]);
-            let node_section_label = if account.account_user.trim().is_empty()
-                || account.account_user == account_label
-            {
-                node_label.to_string()
-            } else {
-                format!("{node_label} ({account_label})")
-            };
+            let account_label = host_label(account, node_host);
 
             for session in &account.sessions {
                 let session_label =
@@ -1549,7 +1679,8 @@ fn flatten_rows(snapshot: &TmuxTreeSnapshot) -> Vec<WorkbenchRow> {
                             "{}:{}",
                             node.node_key, account.account_key
                         )),
-                        node_label: SharedString::from(node_section_label.clone()),
+                        node_label: SharedString::from(account_label.clone()),
+                        node_is_local,
                         session_section_key: SharedString::from(session.session_key.clone()),
                         session_label: SharedString::from(session_label.to_string()),
                         session_detail: SharedString::from(session_detail.clone()),
@@ -1570,7 +1701,7 @@ fn flatten_rows(snapshot: &TmuxTreeSnapshot) -> Vec<WorkbenchRow> {
     rows
 }
 
-fn build_display_rows(rows: &[WorkbenchRow]) -> Vec<DisplayRow> {
+fn build_display_rows(rows: &[WorkbenchRow], collapsed_host_keys: &HashSet<String>) -> Vec<DisplayRow> {
     let mut display_rows = Vec::new();
     let mut last_node_key: Option<&str> = None;
     let mut last_session_key: Option<&str> = None;
@@ -1579,10 +1710,17 @@ fn build_display_rows(rows: &[WorkbenchRow]) -> Vec<DisplayRow> {
         if last_node_key != Some(row.node_section_key.as_ref()) {
             last_node_key = Some(row.node_section_key.as_ref());
             last_session_key = None;
-            display_rows.push(DisplayRow::NodeHeader {
-                row_key: SharedString::from(format!("node:{}", row.node_section_key.as_ref())),
+            display_rows.push(DisplayRow::HostHeader {
+                row_key: SharedString::from(format!("host:{}", row.node_section_key.as_ref())),
+                host_key: row.node_section_key.clone(),
                 label: row.node_label.clone(),
+                local_badge: row.node_is_local,
+                collapsed: collapsed_host_keys.contains(row.node_section_key.as_ref()),
             });
+        }
+
+        if collapsed_host_keys.contains(row.node_section_key.as_ref()) {
+            continue;
         }
 
         if last_session_key != Some(row.session_section_key.as_ref()) {
@@ -1604,6 +1742,34 @@ fn build_display_rows(rows: &[WorkbenchRow]) -> Vec<DisplayRow> {
     display_rows
 }
 
+fn host_label(account: &vitermux::TmuxAccount, node_host: &str) -> String {
+    if account.account_key.contains('@') {
+        return account.account_key.clone();
+    }
+
+    let account_user = first_non_empty([
+        account.account_user.as_str(),
+        account_user_from_account_key(account.account_key.as_str()),
+    ]);
+    if !account_user.is_empty() && !node_host.is_empty() {
+        return format!("{account_user}@{node_host}");
+    }
+
+    first_non_empty([
+        account.account_name.as_str(),
+        account.account_key.as_str(),
+        node_host,
+    ])
+    .to_string()
+}
+
+fn account_user_from_account_key(account_key: &str) -> &str {
+    account_key
+        .split_once('@')
+        .map(|(user, _)| user)
+        .unwrap_or("")
+}
+
 fn session_slot_state_version() -> u8 {
     1
 }
@@ -1614,6 +1780,16 @@ fn default_review_companion_enabled() -> bool {
 
 fn empty_session_slots() -> Vec<Option<SessionSlotAssignment>> {
     vec![None; SESSION_SLOT_COUNT]
+}
+
+fn normalize_collapsed_host_keys(host_keys: &[String]) -> HashSet<String> {
+    host_keys
+        .iter()
+        .filter_map(|host_key| {
+            let host_key = host_key.trim();
+            (!host_key.is_empty()).then(|| host_key.to_string())
+        })
+        .collect()
 }
 
 fn normalize_slot_index(slot_index: usize) -> Option<usize> {
@@ -1669,7 +1845,7 @@ fn build_display_row_index_by_row_key(display_rows: &[DisplayRow]) -> HashMap<St
         .enumerate()
         .filter_map(|(index, row)| match row {
             DisplayRow::Window(row) => Some((row.row_key.to_string(), index)),
-            DisplayRow::NodeHeader { .. } | DisplayRow::SessionHeader { .. } => None,
+            DisplayRow::HostHeader { .. } | DisplayRow::SessionHeader { .. } => None,
         })
         .collect()
 }
@@ -1782,6 +1958,18 @@ fn load_review_companion_enabled(workspace_key: Option<&str>, cx: &App) -> Optio
         .flatten()
         .and_then(|json| serde_json::from_str::<SerializedReviewCompanionState>(&json).ok())?;
     Some(state.enabled)
+}
+
+fn load_collapsed_host_keys(workspace_key: Option<&str>, cx: &App) -> Option<HashSet<String>> {
+    let workspace_key = workspace_key?;
+    let kvp = KeyValueStore::global(cx);
+    let scope = kvp.scoped(COLLAPSED_HOST_SCOPE_KEY);
+    let state = scope
+        .read(workspace_key)
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<SerializedCollapsedHostState>(&json).ok())?;
+    Some(normalize_collapsed_host_keys(&state.host_keys))
 }
 
 fn begin_open_request(open_request_tracker: &Arc<Mutex<OpenRequestTracker>>) -> u64 {
@@ -2833,7 +3021,7 @@ fn selected_display_row_index_in(
     let selected = selected?;
     display_rows.iter().position(|row| match row {
         DisplayRow::Window(row) => row.row_key.as_ref() == selected.as_ref(),
-        DisplayRow::NodeHeader { .. } | DisplayRow::SessionHeader { .. } => false,
+        DisplayRow::HostHeader { .. } | DisplayRow::SessionHeader { .. } => false,
     })
 }
 
@@ -2853,8 +3041,10 @@ mod tests {
     #[test]
     fn flatten_rows_uses_window_session_key_and_dedupe_identity() {
         let snapshot = TmuxTreeSnapshot {
+            self_node_id: "macbook".into(),
             nodes: vec![vitermux::TmuxNode {
                 node_key: "poros".into(),
+                node_id: "poros".into(),
                 node_name: "poros".into(),
                 accounts: vec![vitermux::TmuxAccount {
                     account_key: "albertus@poros".into(),
@@ -2901,8 +3091,43 @@ mod tests {
             row.session_key.as_ref().map(|value| value.as_ref()),
             Some("codex:poros:albertus@poros:123")
         );
-        assert_eq!(row.node_label.as_ref(), "poros (Albertus)");
+        assert_eq!(row.node_label.as_ref(), "albertus@poros");
+        assert!(!row.node_is_local);
         assert_eq!(row.window_label.as_ref(), "frontend-logging-cleanup");
+    }
+
+    #[test]
+    fn flatten_rows_marks_local_host_rows_from_snapshot_self_node() {
+        let snapshot = TmuxTreeSnapshot {
+            self_node_id: "macbook".into(),
+            nodes: vec![vitermux::TmuxNode {
+                node_key: "macbook".into(),
+                node_id: "macbook".into(),
+                node_name: "MacBook".into(),
+                accounts: vec![vitermux::TmuxAccount {
+                    account_key: "albertusangga@macbook".into(),
+                    account_name: "Albertus".into(),
+                    account_user: "albertusangga".into(),
+                    sessions: vec![vitermux::TmuxSession {
+                        session_key: "zed-tabs".into(),
+                        session_name: "zed-tabs".into(),
+                        windows: vec![TmuxWindow {
+                            dedupe_key: "node:macbook/acct:albertusangga@macbook/sess:zed-tabs/win:index:1".into(),
+                            window_name: "vitermux".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let rows = flatten_rows(&snapshot);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].node_label.as_ref(), "albertusangga@macbook");
+        assert!(rows[0].node_is_local);
     }
 
     #[test]
@@ -2951,11 +3176,11 @@ mod tests {
             },
         ];
 
-        let display_rows = build_display_rows(&rows);
+        let display_rows = build_display_rows(&rows, &HashSet::default());
         assert_eq!(display_rows.len(), 6);
         assert!(matches!(
             &display_rows[0],
-            DisplayRow::NodeHeader { label, .. } if label.as_ref() == "poros"
+            DisplayRow::HostHeader { label, collapsed, .. } if label.as_ref() == "albertus@poros" && !collapsed
         ));
         assert!(matches!(
             &display_rows[1],
@@ -2977,6 +3202,53 @@ mod tests {
     }
 
     #[test]
+    fn build_display_rows_hides_children_for_collapsed_host() {
+        let rows = vec![
+            WorkbenchRow {
+                row_key: SharedString::from("row-1"),
+                ..sample_row()
+            },
+            WorkbenchRow {
+                row_key: SharedString::from("row-2"),
+                node_section_key: SharedString::from("node-section-2"),
+                node_label: SharedString::from("albertus@tate"),
+                session_section_key: SharedString::from("session-2"),
+                session_label: SharedString::from("review"),
+                ..sample_row()
+            },
+        ];
+        let collapsed_host_keys: HashSet<String> =
+            ["node-section".to_string()].into_iter().collect();
+
+        let display_rows = build_display_rows(&rows, &collapsed_host_keys);
+        assert_eq!(display_rows.len(), 4);
+        assert!(matches!(
+            &display_rows[0],
+            DisplayRow::HostHeader {
+                label,
+                collapsed: true,
+                ..
+            } if label.as_ref() == "albertus@poros"
+        ));
+        assert!(matches!(
+            &display_rows[1],
+            DisplayRow::HostHeader {
+                label,
+                collapsed: false,
+                ..
+            } if label.as_ref() == "albertus@tate"
+        ));
+        assert!(matches!(
+            &display_rows[2],
+            DisplayRow::SessionHeader { label, .. } if label.as_ref() == "review"
+        ));
+        assert!(matches!(
+            &display_rows[3],
+            DisplayRow::Window(row) if row.row_key.as_ref() == "row-2"
+        ));
+    }
+
+    #[test]
     fn selected_display_row_index_matches_visible_window_row() {
         let display_rows = build_display_rows(&[
             WorkbenchRow {
@@ -2989,7 +3261,7 @@ mod tests {
                 session_label: SharedString::from("review"),
                 ..sample_row()
             },
-        ]);
+        ], &HashSet::default());
 
         assert_eq!(
             selected_display_row_index_in(&display_rows, Some(&SharedString::from("row-1"))),
@@ -3623,6 +3895,7 @@ mod tests {
                     false,
                     true,
                     empty_session_slots(),
+                    HashSet::default(),
                     window,
                     cx,
                 )
@@ -3712,7 +3985,7 @@ mod tests {
 
         panel.update(window, |panel, cx| {
             panel.rows = vec![row_a.clone(), row_b.clone()];
-            panel.display_rows = build_display_rows(&panel.rows);
+            panel.display_rows = build_display_rows(&panel.rows, &HashSet::default());
             panel.selected_row_key = Some(row_a.row_key.clone());
             panel.row_index_by_session_key = build_row_index_by_session_key(&panel.rows);
             panel.row_index_by_terminal_key = build_row_index_by_terminal_key(&panel.rows);
@@ -3982,7 +4255,8 @@ mod tests {
         WorkbenchRow {
             row_key: SharedString::from("row-key"),
             node_section_key: SharedString::from("node-section"),
-            node_label: SharedString::from("poros"),
+            node_label: SharedString::from("albertus@poros"),
+            node_is_local: false,
             session_section_key: SharedString::from("main"),
             session_label: SharedString::from("main"),
             session_detail: SharedString::from("agent-hud"),

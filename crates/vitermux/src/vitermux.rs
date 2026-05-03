@@ -203,6 +203,8 @@ impl VitermuxStore {
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct TmuxTreeSnapshot {
     #[serde(default)]
+    pub self_node_id: String,
+    #[serde(default)]
     pub revision: u64,
     #[serde(default)]
     pub nodes: Vec<TmuxNode>,
