@@ -211,8 +211,17 @@ async fn build_remote_server_from_source(
 
     // By default, we make building remote server from source opt-out and we do not force artifact compression
     // for quicker builds.
-    let build_remote_server =
-        std::env::var("ZED_BUILD_REMOTE_SERVER").unwrap_or("nocompress".into());
+    let (build_remote_server, build_remote_server_explicitly_configured) =
+        match std::env::var("ZED_BUILD_REMOTE_SERVER") {
+            Ok(value) => (value, true),
+            Err(VarError::NotPresent) => ("nocompress".into(), false),
+            Err(VarError::NotUnicode(_)) => {
+                log::warn!(
+                    "ZED_BUILD_REMOTE_SERVER is not valid unicode, falling back to default source-build mode"
+                );
+                ("nocompress".into(), false)
+            }
+        };
 
     if let "never" = &*build_remote_server {
         return Ok(None);
@@ -223,7 +232,8 @@ async fn build_remote_server_from_source(
         log::warn!("ZED_BUILD_REMOTE_SERVER is disabled, but no server binary exists on the server")
     }
 
-    if remote_server_version_matches_local_build(
+    if should_reuse_existing_remote_server_build(
+        build_remote_server_explicitly_configured,
         release_channel,
         remote_server_version,
         app_commit_sha,
@@ -424,6 +434,21 @@ fn remote_server_version_matches_local_build(
 }
 
 #[cfg(any(test, debug_assertions, feature = "build-remote-server-binary"))]
+fn should_reuse_existing_remote_server_build(
+    build_remote_server_explicitly_configured: bool,
+    release_channel: ReleaseChannel,
+    remote_server_version: Option<&str>,
+    app_commit_sha: Option<&AppCommitSha>,
+) -> bool {
+    !build_remote_server_explicitly_configured
+        && remote_server_version_matches_local_build(
+            release_channel,
+            remote_server_version,
+            app_commit_sha,
+        )
+}
+
+#[cfg(any(test, debug_assertions, feature = "build-remote-server-binary"))]
 fn expected_remote_server_build_version(
     release_channel: ReleaseChannel,
     app_commit_sha: Option<&AppCommitSha>,
@@ -601,6 +626,23 @@ mod tests {
             ReleaseChannel::Dev,
             Some("deadbeefcafebabe"),
             None,
+        ));
+    }
+
+    #[test]
+    fn test_explicit_remote_build_configuration_disables_warm_reuse() {
+        let commit = AppCommitSha::new("deadbeefcafebabe".to_string());
+        assert!(!should_reuse_existing_remote_server_build(
+            true,
+            ReleaseChannel::Dev,
+            Some("deadbeefcafebabe"),
+            Some(&commit),
+        ));
+        assert!(should_reuse_existing_remote_server_build(
+            false,
+            ReleaseChannel::Dev,
+            Some("deadbeefcafebabe"),
+            Some(&commit),
         ));
     }
 }
