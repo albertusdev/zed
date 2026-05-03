@@ -65,6 +65,7 @@
   {
     "context": "VitermuxPanel",
     "bindings": {
+      "cmd-shift-r": "vitermux_panel::RenameSelected",
       "alt-cmd-1": ["vitermux_panel::AssignSelectedToSlot", 0],
       "alt-cmd-2": ["vitermux_panel::AssignSelectedToSlot", 1],
       "alt-cmd-3": ["vitermux_panel::AssignSelectedToSlot", 2],

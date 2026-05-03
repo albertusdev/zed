@@ -2,7 +2,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use futures::AsyncReadExt as _;
 use gpui::{App, AppContext as _, Context, Entity, Global, SharedString, Task};
 use http_client::{AsyncBody, HttpClient, Request};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{env, sync::Arc, time::Duration};
 use url::Url;
 
@@ -40,6 +40,31 @@ impl VitermuxClient {
             .await
     }
 
+    pub async fn rename_session(
+        &self,
+        session_id: &str,
+        name: &str,
+    ) -> Result<SessionMutationResponse> {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            bail!("session name cannot be empty");
+        }
+
+        self.post_json(
+            self.build_session_action_url(session_id, "rename")?,
+            Some(&RenameSessionRequest { name: trimmed_name }),
+        )
+        .await
+    }
+
+    pub async fn complete_session(&self, session_id: &str) -> Result<SessionMutationResponse> {
+        self.post_json::<SessionMutationResponse, ()>(
+            self.build_session_action_url(session_id, "complete")?,
+            None,
+        )
+        .await
+    }
+
     async fn fetch_json<T: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
@@ -67,6 +92,37 @@ impl VitermuxClient {
         serde_json::from_str(&body).with_context(|| format!("invalid JSON from {}", url))
     }
 
+    async fn post_json<T, B>(&self, url: Url, body: Option<&B>) -> Result<T>
+    where
+        T: for<'de> Deserialize<'de>,
+        B: Serialize + ?Sized,
+    {
+        let mut request = Request::builder().method("POST").uri(url.as_str());
+        let request = if let Some(body) = body {
+            request = request.header("Content-Type", "application/json");
+            request.body(AsyncBody::from(serde_json::to_string(body)?))?
+        } else {
+            request.body(AsyncBody::empty())?
+        };
+
+        let mut response = self
+            .http_client
+            .send(request)
+            .await
+            .with_context(|| format!("request failed: {}", url))?;
+        let mut body = String::new();
+        response.body_mut().read_to_string(&mut body).await?;
+        if !response.status().is_success() {
+            bail!(
+                "daemon returned {} for {}: {}",
+                response.status(),
+                url,
+                body
+            );
+        }
+        serde_json::from_str(&body).with_context(|| format!("invalid JSON from {}", url))
+    }
+
     fn build_url(&self, path: &str, query: Option<&[(&str, &str)]>) -> Result<Url> {
         let joined = format!("{}{}", self.base_url, path);
         let mut url =
@@ -74,6 +130,24 @@ impl VitermuxClient {
         if let Some(query) = query {
             url.query_pairs_mut().extend_pairs(query.iter().copied());
         }
+        Ok(url)
+    }
+
+    fn build_session_action_url(&self, session_id: &str, action: &str) -> Result<Url> {
+        let mut url = Url::parse(self.base_url.as_ref())
+            .with_context(|| format!("invalid daemon URL: {}", self.base_url))?;
+        let clear_existing_path = url.path().trim_matches('/').is_empty();
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow!("daemon URL cannot be a base for path segments"))?;
+        if clear_existing_path {
+            segments.clear();
+        }
+        segments.push("api");
+        segments.push("sessions");
+        segments.push(session_id);
+        segments.push(action);
+        drop(segments);
         Ok(url)
     }
 }
@@ -448,9 +522,60 @@ impl OpenPlanFailure {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct SessionMutationResponse {
+    #[serde(default)]
+    pub changed: bool,
+    pub session: Option<SessionMutationSession>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct SessionMutationSession {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, rename = "display_name")]
+    pub display_name: String,
+}
+
+impl SessionMutationSession {
+    pub fn canonical_name(&self) -> Option<&str> {
+        if !self.display_name.trim().is_empty() {
+            Some(self.display_name.as_str())
+        } else if !self.name.trim().is_empty() {
+            Some(self.name.as_str())
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RenameSessionRequest<'a> {
+    name: &'a str,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_url_supports_session_rename_endpoint() {
+        let client = VitermuxClient::new(
+            Arc::<str>::from("http://localhost:8401"),
+            Arc::new(http_client::BlockedHttpClient::new()),
+        );
+
+        let url = client
+            .build_url("/api/sessions/codex%3Aporos%3A123/rename", None)
+            .expect("rename URL should build");
+
+        assert_eq!(
+            url.as_str(),
+            "http://localhost:8401/api/sessions/codex%3Aporos%3A123/rename"
+        );
+    }
 
     #[test]
     fn primary_session_key_prefers_harness_session_key() {

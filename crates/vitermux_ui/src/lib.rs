@@ -1,14 +1,15 @@
 use anyhow::{Result, anyhow};
 use collections::{HashMap, HashSet};
 use db::kvp::KeyValueStore;
+use editor::{Editor, MultiBufferOffset};
 use git_ui::project_diff::ProjectDiff;
 use gpui::{
-    Action, AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, ListAlignment, ListOffset, ListSizingBehavior, ListState, ParentElement, Pixels,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity,
-    Window, WindowHandle, actions, list, px,
+    Action, AnyElement, App, AsyncWindowContext, Context, DismissEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, ListAlignment, ListOffset, ListSizingBehavior, ListState,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    Task, WeakEntity, Window, WindowHandle, actions, list, px,
 };
-use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
+use menu::{Cancel, Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
 use parking_lot::Mutex;
 use project::{ProjectPath, git_store::branch_diff::DiffBase};
 use remote::{RemoteConnectionOptions, SshConnectionOptions, same_remote_connection_identity};
@@ -30,7 +31,7 @@ use vitermux::{
     VitermuxStore, ZedOpenPlan,
 };
 use workspace::{
-    MultiWorkspace, OpenMode, Pane, PathList, Toast, Workspace,
+    ModalView, MultiWorkspace, OpenMode, Pane, PathList, Toast, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
     notifications::{DetachAndPromptErr, NotificationId},
 };
@@ -40,6 +41,8 @@ const PROJECT_REPOSITORY_DISCOVERY_ATTEMPTS: usize = 60;
 const PROJECT_REPOSITORY_DISCOVERY_DELAY: Duration = Duration::from_millis(50);
 const REVIEW_COMPANION_SYNC_ATTEMPTS: usize = 60;
 const REVIEW_COMPANION_SYNC_DELAY: Duration = Duration::from_millis(50);
+const MUTATION_REFRESH_ATTEMPTS: usize = 3;
+const MUTATION_REFRESH_DELAY: Duration = Duration::from_millis(150);
 const SESSION_SLOT_COUNT: usize = 9;
 const SESSION_SLOT_SCOPE_KEY: &str = "vitermux_session_slots";
 const OPERATOR_WORKSPACE_SCOPE_KEY: &str = "vitermux_operator_workspace";
@@ -56,6 +59,7 @@ actions!(
         OpenSelected,
         OpenReviewSelected,
         ToggleReviewCompanion,
+        RenameSelected,
     ]
 );
 
@@ -95,6 +99,11 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &ToggleReviewCompanion, window, cx| {
             if let Some(panel) = workspace.panel::<VitermuxPanel>(cx) {
                 panel.update(cx, |panel, cx| panel.toggle_review_companion(window, cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &RenameSelected, window, cx| {
+            if let Some(panel) = workspace.panel::<VitermuxPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.rename_selected(window, cx));
             }
         });
         workspace.register_action(|workspace, action: &ActivateSlot, window, cx| {
@@ -137,6 +146,13 @@ struct SessionSlotAssignment {
     session_key: String,
     #[serde(default)]
     dedupe_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionRenameTarget {
+    row_key: String,
+    session_key: String,
+    current_name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -367,14 +383,11 @@ impl VitermuxPanel {
             return;
         }
 
-        let selected_exists = self
-            .selected_row_key
-            .as_ref()
-            .is_some_and(|selected| {
-                visible_rows
-                    .iter()
-                    .any(|row| row.row_key.as_ref() == selected.as_ref())
-            });
+        let selected_exists = self.selected_row_key.as_ref().is_some_and(|selected| {
+            visible_rows
+                .iter()
+                .any(|row| row.row_key.as_ref() == selected.as_ref())
+        });
         if !selected_exists {
             self.selected_row_key = visible_rows.first().map(|row| row.row_key.clone());
         }
@@ -417,7 +430,10 @@ impl VitermuxPanel {
     }
 
     fn ensure_host_expanded_for_row(&mut self, row: &WorkbenchRow, cx: &mut Context<Self>) {
-        if self.collapsed_host_keys.remove(row.node_section_key.as_ref()) {
+        if self
+            .collapsed_host_keys
+            .remove(row.node_section_key.as_ref())
+        {
             self.save_collapsed_host_keys(cx);
             self.rebuild_display_rows();
         }
@@ -462,6 +478,18 @@ impl VitermuxPanel {
         if let Some(row) = self.selected_row() {
             self.open_review_for_row(row, window, cx);
         }
+    }
+
+    fn rename_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.enable_operator_workspace_mode(window, cx);
+        let Some(target) = self.selected_rename_target() else {
+            self.show_slot_toast(
+                "Select a tracked Vitermux session to rename".to_string(),
+                cx,
+            );
+            return;
+        };
+        self.open_rename_modal(target, window, cx);
     }
 
     fn activate_slot(
@@ -538,6 +566,58 @@ impl VitermuxPanel {
             );
             cx.notify();
         }
+    }
+
+    fn selected_rename_target(&self) -> Option<SessionRenameTarget> {
+        self.selected_row()
+            .and_then(|row| rename_target_for_row(&row))
+    }
+
+    fn open_rename_for_row(
+        &mut self,
+        row: WorkbenchRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = rename_target_for_row(&row) else {
+            self.show_slot_toast(
+                format!(
+                    "{} has no tracked session to rename",
+                    row.window_label.as_ref()
+                ),
+                cx,
+            );
+            return;
+        };
+        self.enable_operator_workspace_mode(window, cx);
+        self.ensure_host_expanded_for_row(&row, cx);
+        self.selected_row_key = Some(row.row_key.clone());
+        self.scroll_selection_into_view();
+        self.open_rename_modal(target, window, cx);
+        cx.notify();
+    }
+
+    fn open_rename_modal(
+        &self,
+        target: SessionRenameTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let panel = cx.entity().downgrade();
+        workspace.update(cx, |workspace, cx| {
+            if let Some(modal) = workspace.active_modal::<RenameSessionModal>(cx) {
+                modal.update(cx, |modal, cx| {
+                    modal.set_target(target.clone(), window, cx);
+                });
+            } else {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    RenameSessionModal::new(panel.clone(), target.clone(), window, cx)
+                });
+            }
+        });
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
@@ -860,6 +940,98 @@ impl VitermuxPanel {
                 return;
             };
             let _ = scope.write(workspace_key, json).await;
+        })
+        .detach();
+    }
+
+    fn rename_session(
+        &mut self,
+        target: SessionRenameTarget,
+        proposed_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let trimmed_name = proposed_name.trim().to_string();
+        if trimmed_name.is_empty() || trimmed_name == target.current_name {
+            return;
+        }
+
+        let client = self.store.read(cx).client();
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .rename_session(&target.session_key, &trimmed_name)
+                .await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(response) => {
+                    let canonical_name = response
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.canonical_name())
+                        .unwrap_or(trimmed_name.as_str())
+                        .trim()
+                        .to_string();
+                    this.apply_renamed_session_label(&target.session_key, &canonical_name, cx);
+                    this.refresh_after_mutation(cx);
+                    this.show_slot_toast(
+                        format!("Renamed {} to {}", target.current_name, canonical_name),
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    this.refresh_after_mutation(cx);
+                    this.show_slot_toast(format!("Rename failed: {}", error), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn apply_renamed_session_label(
+        &mut self,
+        session_key: &str,
+        canonical_name: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if canonical_name.trim().is_empty() {
+            return;
+        }
+
+        let mut changed = false;
+        for row in &mut self.rows {
+            if row
+                .session_key
+                .as_ref()
+                .is_some_and(|value| value.as_ref() == session_key)
+                && row.window_label.as_ref() != canonical_name
+            {
+                row.window_label = SharedString::from(canonical_name.to_string());
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+
+        self.rebuild_display_rows();
+        self.ensure_selection(cx);
+        self.scroll_selection_into_view();
+        cx.notify();
+    }
+
+    fn refresh_after_mutation(&self, cx: &mut Context<Self>) {
+        self.store.update(cx, |store, cx| store.refresh(cx));
+
+        cx.spawn(async move |this, cx| {
+            for _ in 0..MUTATION_REFRESH_ATTEMPTS {
+                cx.background_executor().timer(MUTATION_REFRESH_DELAY).await;
+                if this
+                    .update(cx, |this, cx| {
+                        this.store.update(cx, |store, cx| store.refresh(cx));
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
         })
         .detach();
     }
@@ -1335,7 +1507,7 @@ impl VitermuxPanel {
             )
             .child(
                 Label::new(
-                    "Cmd+1..9 switch tmux tabs  •  Option+Cmd+1..9 assign selected  •  Option+Cmd+/ auto review",
+                    "Cmd+1..9 switch tmux tabs  •  Cmd+Shift+R rename selected  •  Option+Cmd+/ auto review",
                 )
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
@@ -1413,10 +1585,7 @@ impl VitermuxPanel {
                     .gap_1()
                     .items_center()
                     .child(
-                        Disclosure::new(
-                            format!("vitermux-host-toggle-{}", host_key),
-                            !collapsed,
-                        )
+                        Disclosure::new(format!("vitermux-host-toggle-{}", host_key), !collapsed)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.toggle_host_collapsed(host_key_for_toggle.clone(), cx);
                             })),
@@ -1479,6 +1648,7 @@ impl VitermuxPanel {
                 let row_key = row.row_key.clone();
                 let row_clone = row.clone();
                 let review_row = row.clone();
+                let rename_row = row.clone();
                 let row_selected = self.selected_row_key.as_ref() == Some(&row.row_key);
                 let disabled = row.session_key.is_none();
                 let panel_focused = self.active && self.focus_handle.contains_focused(window, cx);
@@ -1509,6 +1679,26 @@ impl VitermuxPanel {
                                         cx,
                                     )
                                     .disabled(disabled),
+                                )
+                            })
+                            .when(!disabled, |this| {
+                                this.child(
+                                    IconButton::new(
+                                        format!("rename:{}", row_key.as_ref()),
+                                        IconName::Pencil,
+                                    )
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Rename session (Cmd+Shift+R)"))
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            this.open_rename_for_row(
+                                                rename_row.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    )),
                                 )
                             })
                             .when(show_review, |this| {
@@ -1646,6 +1836,133 @@ impl Panel for VitermuxPanel {
     }
 }
 
+struct RenameSessionModal {
+    panel: WeakEntity<VitermuxPanel>,
+    editor: Entity<Editor>,
+    target: SessionRenameTarget,
+    last_error: Option<SharedString>,
+}
+
+impl EventEmitter<DismissEvent> for RenameSessionModal {}
+impl ModalView for RenameSessionModal {}
+
+impl Focusable for RenameSessionModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl RenameSessionModal {
+    fn new(
+        panel: WeakEntity<VitermuxPanel>,
+        target: SessionRenameTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Session name", window, cx);
+            editor
+        });
+
+        let mut this = Self {
+            panel,
+            editor,
+            target,
+            last_error: None,
+        };
+        this.reset_editor(window, cx);
+        this
+    }
+
+    fn set_target(
+        &mut self,
+        target: SessionRenameTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.target = target;
+        self.last_error = None;
+        self.reset_editor(window, cx);
+        cx.notify();
+    }
+
+    fn reset_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current_name = self.target.current_name.clone();
+        let selection_end = current_name.len();
+        self.editor.update(cx, |editor, cx| {
+            editor.set_text(current_name, window, cx);
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([MultiBufferOffset(0)..MultiBufferOffset(selection_end)]);
+            });
+        });
+    }
+
+    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let proposed_name = self.editor.read(cx).text(cx).trim().to_string();
+        if proposed_name.is_empty() {
+            self.last_error = Some("Session name cannot be empty".into());
+            cx.notify();
+            return;
+        }
+
+        let Some(panel) = self.panel.upgrade() else {
+            self.last_error = Some("Vitermux panel is no longer available".into());
+            cx.notify();
+            return;
+        };
+
+        panel.update(cx, |panel, cx| {
+            panel.rename_session(self.target.clone(), proposed_name.clone(), cx);
+        });
+        window.focus(&panel.focus_handle(cx), cx);
+        cx.emit(DismissEvent);
+    }
+}
+
+impl Render for RenameSessionModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+
+        v_flex()
+            .key_context("VitermuxRenameModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_3(cx)
+            .w_96()
+            .overflow_hidden()
+            .child(
+                div()
+                    .p_2()
+                    .border_b_1()
+                    .border_color(theme.colors().border_variant)
+                    .child(self.editor.clone()),
+            )
+            .child(
+                h_flex()
+                    .bg(theme.colors().editor_background)
+                    .rounded_b_sm()
+                    .w_full()
+                    .p_2()
+                    .gap_1()
+                    .when_some(self.last_error.clone(), |this, error| {
+                        this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+                    })
+                    .when(self.last_error.is_none(), |this| {
+                        this.child(
+                            Label::new("Rename the selected session and keep tmux in sync.")
+                                .color(Color::Muted)
+                                .size(LabelSize::Small),
+                        )
+                    }),
+            )
+    }
+}
+
 struct MissingSessionToast;
 struct SessionSlotToast;
 
@@ -1705,7 +2022,10 @@ fn flatten_rows(snapshot: &TmuxTreeSnapshot) -> Vec<WorkbenchRow> {
     rows
 }
 
-fn build_display_rows(rows: &[WorkbenchRow], collapsed_host_keys: &HashSet<String>) -> Vec<DisplayRow> {
+fn build_display_rows(
+    rows: &[WorkbenchRow],
+    collapsed_host_keys: &HashSet<String>,
+) -> Vec<DisplayRow> {
     let mut display_rows = Vec::new();
     let mut last_node_key: Option<&str> = None;
     let mut last_session_key: Option<&str> = None;
@@ -2912,13 +3232,13 @@ fn window_detail(window: &TmuxWindow) -> String {
         non_empty_string(window.harness.status.as_str()),
         non_empty_string(window.binding.cwd.as_str()),
         non_empty_string(window.binding.confidence.as_str()),
-        non_empty_string(window.attention.as_str()),
+        attention_detail(window.attention.as_str()),
         non_empty_string(window.attach_state.as_str()),
     ])
 }
 
 fn review_available(row: &WorkbenchRow) -> bool {
-    row.session_key.is_some() && row.attention.as_ref() == "new_review"
+    row.session_key.is_some() && matches!(row.attention.as_ref(), "new_review" | "urgent")
 }
 
 fn join_detail_parts(parts: impl IntoIterator<Item = Option<String>>) -> String {
@@ -2930,19 +3250,53 @@ fn join_detail_parts(parts: impl IntoIterator<Item = Option<String>>) -> String 
         .join("  ")
 }
 
+fn rename_target_for_row(row: &WorkbenchRow) -> Option<SessionRenameTarget> {
+    let session_key = row.session_key.as_ref()?.trim();
+    if session_key.is_empty() {
+        return None;
+    }
+
+    Some(SessionRenameTarget {
+        row_key: row.row_key.to_string(),
+        session_key: session_key.to_string(),
+        current_name: row.window_label.to_string(),
+    })
+}
+
+fn attention_detail(attention: &str) -> Option<String> {
+    let label = match attention {
+        "urgent" | "new_review" => "needs review",
+        "watching" => "waiting",
+        "snoozed" => "snoozed",
+        "working" => "working",
+        "idle" => "idle",
+        "complete" => "reviewed",
+        "blocked" => "parked",
+        "archived" => "archived",
+        _ => "",
+    };
+
+    non_empty_string(label)
+}
+
 fn attention_icon(attention: &str) -> IconName {
     match attention {
-        "new_review" | "blocked" => IconName::Warning,
+        "urgent" | "new_review" => IconName::Warning,
+        "watching" => IconName::Eye,
+        "snoozed" => IconName::Clock,
         "working" => IconName::Terminal,
+        "complete" => IconName::Check,
+        "blocked" | "archived" => IconName::Archive,
+        "idle" => IconName::Circle,
         _ => IconName::SquareDot,
     }
 }
 
 fn attention_color(attention: &str) -> Color {
     match attention {
-        "new_review" => Color::Warning,
-        "blocked" => Color::Error,
+        "urgent" | "new_review" => Color::Warning,
         "working" => Color::Accent,
+        "complete" => Color::Success,
         _ => Color::Muted,
     }
 }
@@ -3116,7 +3470,9 @@ mod tests {
                         session_key: "zed-tabs".into(),
                         session_name: "zed-tabs".into(),
                         windows: vec![TmuxWindow {
-                            dedupe_key: "node:macbook/acct:albertusangga@macbook/sess:zed-tabs/win:index:1".into(),
+                            dedupe_key:
+                                "node:macbook/acct:albertusangga@macbook/sess:zed-tabs/win:index:1"
+                                    .into(),
                             window_name: "vitermux".into(),
                             harness: vitermux::HarnessBinding {
                                 session_key: "codex:local:albertusangga@macbook:123".into(),
@@ -3308,18 +3664,21 @@ mod tests {
 
     #[test]
     fn selected_display_row_index_matches_visible_window_row() {
-        let display_rows = build_display_rows(&[
-            WorkbenchRow {
-                row_key: SharedString::from("row-1"),
-                ..sample_row()
-            },
-            WorkbenchRow {
-                row_key: SharedString::from("row-2"),
-                session_section_key: SharedString::from("review"),
-                session_label: SharedString::from("review"),
-                ..sample_row()
-            },
-        ], &HashSet::default());
+        let display_rows = build_display_rows(
+            &[
+                WorkbenchRow {
+                    row_key: SharedString::from("row-1"),
+                    ..sample_row()
+                },
+                WorkbenchRow {
+                    row_key: SharedString::from("row-2"),
+                    session_section_key: SharedString::from("review"),
+                    session_label: SharedString::from("review"),
+                    ..sample_row()
+                },
+            ],
+            &HashSet::default(),
+        );
 
         assert_eq!(
             selected_display_row_index_in(&display_rows, Some(&SharedString::from("row-1"))),
@@ -3604,6 +3963,35 @@ mod tests {
                 && keymap.contains(r#""alt-cmd-/": "vitermux_panel::ToggleReviewCompanion""#),
             "operator workspace context should also bind the review companion toggle"
         );
+    }
+
+    #[test]
+    fn default_keymap_binds_rename_selected_in_vitermux_panel() {
+        let keymap = include_str!("../../../assets/keymaps/default-macos.json");
+        assert!(
+            keymap.contains(r#""context": "VitermuxPanel""#)
+                && keymap.contains(r#""cmd-shift-r": "vitermux_panel::RenameSelected""#),
+            "vitermux panel should expose a first-class rename shortcut"
+        );
+    }
+
+    #[test]
+    fn default_linux_keymap_binds_rename_selected_in_vitermux_panel() {
+        let keymap = include_str!("../../../assets/keymaps/default-linux.json");
+        assert!(
+            keymap.contains(r#""context": "VitermuxPanel""#)
+                && keymap.contains(r#""cmd-shift-r": "vitermux_panel::RenameSelected""#),
+            "linux vitermux panel should expose a first-class rename shortcut"
+        );
+    }
+
+    #[test]
+    fn attention_color_only_warns_for_canonical_new_review_or_urgent() {
+        assert_eq!(attention_color("new_review"), Color::Warning);
+        assert_eq!(attention_color("urgent"), Color::Warning);
+        assert_eq!(attention_color("watching"), Color::Muted);
+        assert_eq!(attention_color("blocked"), Color::Muted);
+        assert_eq!(attention_color("working"), Color::Accent);
     }
 
     #[test]
@@ -4307,6 +4695,27 @@ mod tests {
             workspace_a_terminal_count, 1,
             "reusing a focused tmux tab should not create a second terminal item"
         );
+    }
+
+    #[test]
+    fn rename_selected_requires_a_selected_session_row() {
+        let row = WorkbenchRow {
+            session_key: None,
+            ..sample_row()
+        };
+
+        assert_eq!(rename_target_for_row(&row), None);
+    }
+
+    #[test]
+    fn rename_selected_targets_primary_agent_for_window_row() {
+        let row = sample_row();
+
+        let target = rename_target_for_row(&row).expect("sample row should be renameable");
+
+        assert_eq!(target.session_key, "codex:poros:albertus@poros:123");
+        assert_eq!(target.current_name, "frontend-logging-cleanup");
+        assert_eq!(target.row_key, "row-key");
     }
 
     fn sample_row() -> WorkbenchRow {
