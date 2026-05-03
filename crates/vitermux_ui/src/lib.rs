@@ -239,6 +239,7 @@ pub struct VitermuxPanel {
     assigned_slot_by_row_key: HashMap<String, usize>,
     session_slots: Vec<Option<SessionSlotAssignment>>,
     collapsed_host_keys: HashSet<String>,
+    pending_session_labels: HashMap<String, SharedString>,
     selected_row_key: Option<SharedString>,
     last_focused_terminal_key: Option<String>,
     review_companion_enabled: bool,
@@ -328,6 +329,7 @@ impl VitermuxPanel {
             assigned_slot_by_row_key: HashMap::default(),
             session_slots,
             collapsed_host_keys,
+            pending_session_labels: HashMap::default(),
             selected_row_key: None,
             last_focused_terminal_key: None,
             review_companion_enabled,
@@ -352,7 +354,11 @@ impl VitermuxPanel {
             .read(cx)
             .snapshot()
             .cloned()
-            .map(|snapshot| flatten_rows(&snapshot))
+            .map(|snapshot| {
+                let mut rows = flatten_rows(&snapshot);
+                self.apply_pending_session_label_overlays(&mut rows);
+                rows
+            })
             .unwrap_or_default();
         self.row_index_by_key = build_row_index_by_key(&self.rows);
         self.row_index_by_session_key = build_row_index_by_session_key(&self.rows);
@@ -373,6 +379,37 @@ impl VitermuxPanel {
         );
         if seeded_slots {
             cx.notify();
+        }
+    }
+
+    fn apply_pending_session_label_overlays(&mut self, rows: &mut [WorkbenchRow]) {
+        if self.pending_session_labels.is_empty() {
+            return;
+        }
+
+        let mut visible_sessions = HashSet::default();
+        let mut settled_sessions = Vec::new();
+        for row in rows {
+            let Some(session_key) = row.session_key.as_ref() else {
+                continue;
+            };
+            let session_key = session_key.to_string();
+            visible_sessions.insert(session_key.clone());
+
+            let Some(pending_label) = self.pending_session_labels.get(session_key.as_str()) else {
+                continue;
+            };
+            if row.window_label.as_ref() == pending_label.as_ref() {
+                settled_sessions.push(session_key);
+                continue;
+            }
+            row.window_label = pending_label.clone();
+        }
+
+        self.pending_session_labels
+            .retain(|session_key, _| visible_sessions.contains(session_key));
+        for session_key in settled_sessions {
+            self.pending_session_labels.remove(session_key.as_str());
         }
     }
 
@@ -995,6 +1032,10 @@ impl VitermuxPanel {
             return;
         }
 
+        self.pending_session_labels.insert(
+            session_key.to_string(),
+            SharedString::from(canonical_name.to_string()),
+        );
         let mut changed = false;
         for row in &mut self.rows {
             if row

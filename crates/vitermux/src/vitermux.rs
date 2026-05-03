@@ -169,6 +169,7 @@ pub struct VitermuxStore {
     connection_state: VitermuxConnectionState,
     last_error: Option<SharedString>,
     is_refreshing: bool,
+    queued_refresh: bool,
     refresh_task: Task<()>,
     poll_task: Task<()>,
 }
@@ -203,6 +204,7 @@ impl VitermuxStore {
             connection_state: VitermuxConnectionState::Connecting,
             last_error: None,
             is_refreshing: false,
+            queued_refresh: false,
             refresh_task: Task::ready(()),
             poll_task: Task::ready(()),
         };
@@ -233,6 +235,7 @@ impl VitermuxStore {
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.is_refreshing {
+            self.queued_refresh = true;
             return;
         }
         self.is_refreshing = true;
@@ -241,6 +244,8 @@ impl VitermuxStore {
             let result = client.fetch_tmux_tree().await;
             let _ = this.update(cx, |this, cx| {
                 this.is_refreshing = false;
+                let queued_refresh = this.queued_refresh;
+                this.queued_refresh = false;
                 match result {
                     Ok(snapshot) => {
                         this.snapshot = Some(snapshot);
@@ -251,6 +256,9 @@ impl VitermuxStore {
                         this.connection_state = VitermuxConnectionState::Error;
                         this.last_error = Some(error.to_string().into());
                     }
+                }
+                if queued_refresh {
+                    this.refresh(cx);
                 }
                 cx.notify();
             });
@@ -559,6 +567,8 @@ struct RenameSessionRequest<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_client::Response;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn build_url_supports_session_rename_endpoint() {
@@ -574,6 +584,110 @@ mod tests {
         assert_eq!(
             url.as_str(),
             "http://localhost:8401/api/sessions/codex%3Aporos%3A123/rename"
+        );
+    }
+
+    #[gpui::test]
+    async fn rename_session_posts_json_body_and_decodes_response(_cx: &mut gpui::TestAppContext) {
+        let captured = Arc::new(Mutex::new(Vec::<(String, String, String)>::new()));
+        let captured_clone = captured.clone();
+        let http_client = http_client::FakeHttpClient::create(move |mut request| {
+            let captured = captured_clone.clone();
+            async move {
+                let mut body = String::new();
+                request.body_mut().read_to_string(&mut body).await?;
+                captured.lock().unwrap().push((
+                    request.method().to_string(),
+                    request.uri().to_string(),
+                    body,
+                ));
+                Ok(Response::builder()
+                    .status(200)
+                    .body(AsyncBody::from(
+                        r#"{"changed":true,"session":{"id":"codex:poros:123","display_name":"Renamed Session"}}"#,
+                    ))
+                    .unwrap())
+            }
+        });
+        let client = VitermuxClient::new(Arc::<str>::from("http://localhost:8401"), http_client);
+
+        let response = client
+            .rename_session("codex:poros:123", "  Renamed Session  ")
+            .await
+            .expect("rename mutation should succeed");
+
+        assert!(response.changed, "rename should report changed");
+        assert_eq!(
+            response
+                .session
+                .as_ref()
+                .and_then(SessionMutationSession::canonical_name),
+            Some("Renamed Session")
+        );
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1, "expected exactly one request");
+        assert_eq!(captured[0].0, "POST");
+        assert_eq!(
+            captured[0].1,
+            "http://localhost:8401/api/sessions/codex:poros:123/rename"
+        );
+        assert_eq!(captured[0].2.trim(), r#"{"name":"Renamed Session"}"#);
+    }
+
+    #[gpui::test]
+    async fn complete_session_posts_empty_body_and_decodes_response(
+        _cx: &mut gpui::TestAppContext,
+    ) {
+        let captured = Arc::new(Mutex::new(Vec::<(String, String, String)>::new()));
+        let captured_clone = captured.clone();
+        let http_client = http_client::FakeHttpClient::create(move |mut request| {
+            let captured = captured_clone.clone();
+            async move {
+                let mut body = String::new();
+                request.body_mut().read_to_string(&mut body).await?;
+                captured.lock().unwrap().push((
+                    request.method().to_string(),
+                    request.uri().to_string(),
+                    body,
+                ));
+                Ok(Response::builder()
+                    .status(200)
+                    .body(AsyncBody::from(
+                        r#"{"changed":false,"session":{"id":"codex:poros:123","display_name":"Stable Session"}}"#,
+                    ))
+                    .unwrap())
+            }
+        });
+        let client = VitermuxClient::new(Arc::<str>::from("http://localhost:8401"), http_client);
+
+        let response = client
+            .complete_session("codex:poros:123")
+            .await
+            .expect("complete mutation should succeed");
+
+        assert!(
+            !response.changed,
+            "complete test response should preserve changed=false"
+        );
+        assert_eq!(
+            response
+                .session
+                .as_ref()
+                .and_then(SessionMutationSession::canonical_name),
+            Some("Stable Session")
+        );
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1, "expected exactly one request");
+        assert_eq!(captured[0].0, "POST");
+        assert_eq!(
+            captured[0].1,
+            "http://localhost:8401/api/sessions/codex:poros:123/complete"
+        );
+        assert!(
+            captured[0].2.is_empty(),
+            "complete should send an empty body"
         );
     }
 
