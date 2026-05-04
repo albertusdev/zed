@@ -697,6 +697,9 @@ impl TerminalPanel {
             if let Some((existing_item_index, task_pane, existing_terminal)) =
                 terminals_for_task.pop()
             {
+                if !should_materialize() {
+                    return Task::ready(Ok(WeakEntity::new_invalid()));
+                }
                 if task.allow_concurrent_runs {
                     return self.replace_terminal(
                         task,
@@ -802,7 +805,9 @@ impl TerminalPanel {
         cx.spawn_in(window, async move |terminal_panel, cx| {
             let result = spawn_task.await;
             let waiter_result = match &result {
-                Ok(terminal) if terminal.upgrade().is_some() => PendingCenterSpawnOutcome::Materialized,
+                Ok(terminal) if terminal.upgrade().is_some() => {
+                    PendingCenterSpawnOutcome::Materialized
+                }
                 Ok(_) => PendingCenterSpawnOutcome::OwnerStale,
                 Err(error) => PendingCenterSpawnOutcome::Failed(error.to_string()),
             };
@@ -1546,8 +1551,55 @@ fn terminal_task_label_matches(left: &str, right: &str) -> bool {
         || normalize_vitermux_terminal_label(left) == normalize_vitermux_terminal_label(right)
 }
 
-fn normalize_vitermux_terminal_label(label: &str) -> &str {
-    label.strip_prefix("vitermux:").unwrap_or(label)
+fn normalize_vitermux_terminal_label(label: &str) -> String {
+    let label = label.strip_prefix("vitermux:").unwrap_or(label).trim();
+    canonical_vitermux_tmux_window_label(label).unwrap_or_else(|| label.to_string())
+}
+
+fn canonical_vitermux_tmux_window_label(label: &str) -> Option<String> {
+    let mut node = None;
+    let mut account = None;
+    let mut server = None;
+    let mut session = None;
+    let mut window = None;
+
+    for segment in label.split('/') {
+        let (key, value) = segment.split_once(':')?;
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            "node" => node = Some(value),
+            "acct" => account = Some(value),
+            "srv" => server = Some(value),
+            "sess" => session = Some(value),
+            "win" => window = Some(value),
+            _ => {}
+        }
+    }
+
+    let node = node?;
+    let account = account?;
+    let session = session?;
+    let window = window?;
+    let window = if !window.contains(':') && !window.starts_with('@') {
+        format!("index:{window}")
+    } else {
+        window.to_string()
+    };
+    let server = server
+        .or_else(|| session.split_once(':').map(|(server, _)| server))
+        .unwrap_or("default");
+    let session = if session.starts_with(&format!("{server}:")) {
+        session.to_string()
+    } else {
+        format!("{server}:{session}")
+    };
+
+    Some(format!(
+        "node:{node}/acct:{account}/srv:{server}/sess:{session}/win:{window}"
+    ))
 }
 
 struct FailedToSpawnTerminal {
@@ -2302,6 +2354,217 @@ mod tests {
         assert_eq!(
             focused_label.as_deref(),
             Some(existing_task.full_label.as_str())
+        );
+    }
+
+    #[gpui::test]
+    async fn spawn_task_in_center_pane_reuses_existing_canonical_vitermux_terminal_alias(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let existing_task = SpawnInTerminal {
+            id: TaskId(
+                "node:macbook/acct:albertusangga@macbook/srv:default/sess:default:zed-tabs/win:index:1"
+                    .into(),
+            ),
+            full_label:
+                "node:macbook/acct:albertusangga@macbook/srv:default/sess:default:zed-tabs/win:index:1"
+                    .into(),
+            label: "zed-pristine-a".into(),
+            reveal: RevealStrategy::Always,
+            reveal_target: RevealTarget::Center,
+            hide: HideStrategy::Never,
+            ..SpawnInTerminal::default()
+        };
+        let reuse_task = SpawnInTerminal {
+            id: TaskId("node:macbook/acct:albertusangga@macbook/sess:zed-tabs/win:index:1".into()),
+            full_label: "node:macbook/acct:albertusangga@macbook/sess:zed-tabs/win:index:1".into(),
+            label: "zed-pristine-a".into(),
+            reveal: RevealStrategy::Always,
+            reveal_target: RevealTarget::Center,
+            hide: HideStrategy::Never,
+            ..SpawnInTerminal::default()
+        };
+
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    TerminalPanel::add_center_terminal(workspace, window, cx, {
+                        let existing_task = existing_task.clone();
+                        move |project, cx| project.create_terminal_task(existing_task, cx)
+                    })
+                })
+            })
+            .expect("Failed to update workspace")
+            .await
+            .expect("Failed to create existing center terminal");
+        cx.run_until_parked();
+
+        let reuse_pane = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace.workspace().read(cx).active_pane().clone()
+            })
+            .expect("Failed to read reuse pane");
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.spawn_task_in_center_pane(&reuse_task, reuse_pane, window, cx)
+                })
+            })
+            .expect("Failed to dispatch center-pane reuse")
+            .await
+            .expect("Failed to reuse existing center terminal");
+        cx.run_until_parked();
+
+        let terminal_count_after = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .panes()
+                    .iter()
+                    .flat_map(|pane| pane.read(cx).items_of_type::<TerminalView>())
+                    .count()
+            })
+            .expect("Failed to count center terminals after reuse");
+        assert_eq!(
+            terminal_count_after, 1,
+            "canonical and legacy Vitermux tmux identities should reuse the same warm terminal"
+        );
+    }
+
+    #[gpui::test]
+    async fn spawn_task_in_center_pane_reuses_legacy_window_index_alias(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let existing_task = SpawnInTerminal {
+            id: TaskId(
+                "node:poros/acct:albertus@poros/srv:default/sess:default:main/win:index:2".into(),
+            ),
+            full_label: "node:poros/acct:albertus@poros/srv:default/sess:default:main/win:index:2"
+                .into(),
+            label: "frontend-logging-cleanup".into(),
+            reveal: RevealStrategy::Always,
+            reveal_target: RevealTarget::Center,
+            hide: HideStrategy::Never,
+            ..SpawnInTerminal::default()
+        };
+        let reuse_task = SpawnInTerminal {
+            id: TaskId("node:poros/acct:albertus@poros/sess:main/win:2".into()),
+            full_label: "node:poros/acct:albertus@poros/sess:main/win:2".into(),
+            label: "frontend-logging-cleanup".into(),
+            reveal: RevealStrategy::Always,
+            reveal_target: RevealTarget::Center,
+            hide: HideStrategy::Never,
+            ..SpawnInTerminal::default()
+        };
+
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    TerminalPanel::add_center_terminal(workspace, window, cx, {
+                        let existing_task = existing_task.clone();
+                        move |project, cx| project.create_terminal_task(existing_task, cx)
+                    })
+                })
+            })
+            .expect("Failed to update workspace")
+            .await
+            .expect("Failed to create existing center terminal");
+        cx.run_until_parked();
+
+        let reuse_pane = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace.workspace().read(cx).active_pane().clone()
+            })
+            .expect("Failed to read reuse pane");
+        window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.spawn_task_in_center_pane(&reuse_task, reuse_pane, window, cx)
+                })
+            })
+            .expect("Failed to dispatch center-pane reuse")
+            .await
+            .expect("Failed to reuse existing center terminal");
+        cx.run_until_parked();
+
+        let terminal_count_after = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .panes()
+                    .iter()
+                    .flat_map(|pane| pane.read(cx).items_of_type::<TerminalView>())
+                    .count()
+            })
+            .expect("Failed to count center terminals after reuse");
+        assert_eq!(
+            terminal_count_after, 1,
+            "legacy win:2 aliases should reuse a canonical win:index:2 Vitermux terminal"
+        );
+    }
+
+    #[gpui::test]
+    async fn spawn_task_in_center_pane_guard_skips_stale_vitermux_reuse(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let existing_task = SpawnInTerminal {
+            id: TaskId("node:local/acct:me/sess:zed-tabs/win:index:1".into()),
+            full_label: "node:local/acct:me/sess:zed-tabs/win:index:1".into(),
+            label: "zed-pristine-a".into(),
+            reveal: RevealStrategy::Always,
+            reveal_target: RevealTarget::Center,
+            hide: HideStrategy::Never,
+            ..SpawnInTerminal::default()
+        };
+
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    TerminalPanel::add_center_terminal(workspace, window, cx, {
+                        let existing_task = existing_task.clone();
+                        move |project, cx| project.create_terminal_task(existing_task, cx)
+                    })
+                })
+            })
+            .expect("Failed to update workspace")
+            .await
+            .expect("Failed to create existing center terminal");
+        cx.run_until_parked();
+
+        let reuse_pane = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace.workspace().read(cx).active_pane().clone()
+            })
+            .expect("Failed to read reuse pane");
+        let reused_terminal = window_handle
+            .update(cx, |_, window, cx| {
+                terminal_panel.update(cx, |panel, cx| {
+                    panel.spawn_task_in_center_pane_with_guard(
+                        &existing_task,
+                        reuse_pane,
+                        Arc::new(|| false),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("Failed to dispatch guarded center-pane reuse")
+            .await
+            .expect("Guarded stale reuse should return cleanly");
+
+        assert!(
+            reused_terminal.upgrade().is_none(),
+            "stale guarded reuse should not reactivate an existing terminal"
         );
     }
 

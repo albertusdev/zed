@@ -1237,6 +1237,7 @@ impl VitermuxPanel {
         };
         let open_plan_cache = self.open_plan_cache.clone();
         let requesting_window = window.window_handle().downcast::<MultiWorkspace>();
+        let has_requesting_window = requesting_window.is_some();
         let preferred_terminal_key = self.last_focused_terminal_key.clone();
         let review_companion_enabled = self.review_companion_enabled;
         let open_request_tracker = self.open_request_tracker.clone();
@@ -1324,7 +1325,11 @@ impl VitermuxPanel {
                     }
                     let source_workspace_is_remote = workspace
                         .read_with(cx, |workspace, cx| workspace.project().read(cx).is_remote());
-                    if !allow_source_workspace_attach_fallback(source_workspace_is_remote) {
+                    if !allow_source_workspace_attach_fallback(
+                        &plan,
+                        source_workspace_is_remote,
+                        has_requesting_window,
+                    ) {
                         if !is_latest_open_request(&open_request_tracker, request_id) {
                             return Ok(());
                         }
@@ -2494,13 +2499,60 @@ fn looks_like_vitermux_terminal_label(label: &str) -> bool {
         || (label.starts_with("node:") && label.contains("/sess:") && label.contains("/win:"))
 }
 
-fn normalize_vitermux_terminal_label(label: &str) -> &str {
-    label.strip_prefix("vitermux:").unwrap_or(label)
+fn normalize_vitermux_terminal_label(label: &str) -> String {
+    let label = label.strip_prefix("vitermux:").unwrap_or(label).trim();
+    canonical_vitermux_tmux_window_label(label).unwrap_or_else(|| label.to_string())
 }
 
 fn vitermux_terminal_label_matches(left: &str, right: &str) -> bool {
     left == right
         || normalize_vitermux_terminal_label(left) == normalize_vitermux_terminal_label(right)
+}
+
+fn canonical_vitermux_tmux_window_label(label: &str) -> Option<String> {
+    let mut node = None;
+    let mut account = None;
+    let mut server = None;
+    let mut session = None;
+    let mut window = None;
+
+    for segment in label.split('/') {
+        let (key, value) = segment.split_once(':')?;
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            "node" => node = Some(value),
+            "acct" => account = Some(value),
+            "srv" => server = Some(value),
+            "sess" => session = Some(value),
+            "win" => window = Some(value),
+            _ => {}
+        }
+    }
+
+    let node = node?;
+    let account = account?;
+    let session = session?;
+    let window = window?;
+    let window = if !window.contains(':') && !window.starts_with('@') {
+        format!("index:{window}")
+    } else {
+        window.to_string()
+    };
+    let server = server
+        .or_else(|| session.split_once(':').map(|(server, _)| server))
+        .unwrap_or("default");
+    let session = if session.starts_with(&format!("{server}:")) {
+        session.to_string()
+    } else {
+        format!("{server}:{session}")
+    };
+
+    Some(format!(
+        "node:{node}/acct:{account}/srv:{server}/sess:{session}/win:{window}"
+    ))
 }
 
 fn insert_terminal_key_aliases(
@@ -2512,11 +2564,17 @@ fn insert_terminal_key_aliases(
         return;
     }
     index_by_terminal_key.insert(terminal_key.to_string(), index);
+    let stripped = terminal_key
+        .strip_prefix("vitermux:")
+        .unwrap_or(terminal_key);
+    if stripped != terminal_key {
+        index_by_terminal_key.insert(stripped.to_string(), index);
+    }
     let normalized = normalize_vitermux_terminal_label(terminal_key);
-    if normalized != terminal_key {
-        index_by_terminal_key.insert(normalized.to_string(), index);
-    } else if looks_like_vitermux_terminal_label(terminal_key) {
-        index_by_terminal_key.insert(format!("vitermux:{terminal_key}"), index);
+    index_by_terminal_key.insert(normalized.clone(), index);
+    if looks_like_vitermux_terminal_label(terminal_key) {
+        index_by_terminal_key.insert(format!("vitermux:{stripped}"), index);
+        index_by_terminal_key.insert(format!("vitermux:{normalized}"), index);
     }
 }
 
@@ -2544,7 +2602,7 @@ fn store_cached_open_plan(
     session_key: &str,
     plan: &ZedOpenPlan,
 ) {
-    if plan.failure.is_some() {
+    if plan.failure.is_some() || plan.project.mode == "remote" {
         return;
     }
     open_plan_cache
@@ -3548,8 +3606,12 @@ fn attach_inside_target_remote_workspace(
     plan.project.mode == "remote" && matched_project_context && workspace_is_remote
 }
 
-fn allow_source_workspace_attach_fallback(source_workspace_is_remote: bool) -> bool {
-    !source_workspace_is_remote
+fn allow_source_workspace_attach_fallback(
+    plan: &ZedOpenPlan,
+    source_workspace_is_remote: bool,
+    has_requesting_window: bool,
+) -> bool {
+    !source_workspace_is_remote && (plan.project.mode != "remote" || !has_requesting_window)
 }
 
 fn single_quote(value: &str) -> String {
@@ -3936,6 +3998,56 @@ mod tests {
                 .expect("prefixed row key should match")
                 .dedupe_key,
             row.dedupe_key
+        );
+    }
+
+    #[test]
+    fn row_for_terminal_task_label_matches_canonical_tmux_identity_aliases() {
+        let row = WorkbenchRow {
+            row_key: SharedString::from(
+                "node:macbook/acct:albertusangga@macbook/srv:default/sess:default:zed-tabs/win:index:1",
+            ),
+            dedupe_key: SharedString::from(
+                "node:macbook/acct:albertusangga@macbook/srv:default/sess:default:zed-tabs/win:index:1",
+            ),
+            ..sample_row()
+        };
+        let rows = vec![row.clone()];
+        let legacy_row_key = "node:macbook/acct:albertusangga@macbook/sess:zed-tabs/win:index:1";
+        let prefixed_legacy_row_key = format!("vitermux:{legacy_row_key}");
+
+        assert_eq!(
+            row_for_terminal_task_label(&rows, legacy_row_key)
+                .expect("legacy row key should match canonical tmux identity")
+                .row_key,
+            row.row_key
+        );
+        assert_eq!(
+            row_for_terminal_task_label(&rows, &prefixed_legacy_row_key)
+                .expect("prefixed legacy row key should match canonical tmux identity")
+                .dedupe_key,
+            row.dedupe_key
+        );
+    }
+
+    #[test]
+    fn row_for_terminal_task_label_matches_legacy_window_index_aliases() {
+        let row = WorkbenchRow {
+            row_key: SharedString::from(
+                "node:poros/acct:albertus@poros/srv:default/sess:default:main/win:index:2",
+            ),
+            dedupe_key: SharedString::from(
+                "node:poros/acct:albertus@poros/srv:default/sess:default:main/win:index:2",
+            ),
+            ..sample_row()
+        };
+        let rows = vec![row.clone()];
+
+        assert_eq!(
+            row_for_terminal_task_label(&rows, "node:poros/acct:albertus@poros/sess:main/win:2")
+                .expect("legacy window index should match canonical tmux identity")
+                .row_key,
+            row.row_key
         );
     }
 
@@ -4433,9 +4545,76 @@ mod tests {
     }
 
     #[test]
-    fn source_workspace_attach_fallback_is_only_allowed_from_local_workspace() {
-        assert!(allow_source_workspace_attach_fallback(false));
-        assert!(!allow_source_workspace_attach_fallback(true));
+    fn source_workspace_attach_fallback_requires_a_local_non_remote_plan() {
+        let local_plan = sample_plan();
+        let remote_plan = ZedOpenPlan {
+            project: vitermux::ZedProjectTarget {
+                mode: "remote".into(),
+                remote_path: "/home/albertus/dev/agent-hud".into(),
+                ..Default::default()
+            },
+            ..sample_plan()
+        };
+
+        assert!(allow_source_workspace_attach_fallback(
+            &local_plan,
+            false,
+            true
+        ));
+        assert!(!allow_source_workspace_attach_fallback(
+            &local_plan,
+            true,
+            true
+        ));
+        assert!(!allow_source_workspace_attach_fallback(
+            &remote_plan,
+            false,
+            true
+        ));
+        assert!(!allow_source_workspace_attach_fallback(
+            &remote_plan,
+            true,
+            true
+        ));
+        assert!(allow_source_workspace_attach_fallback(
+            &remote_plan,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn store_cached_open_plan_skips_remote_plans() {
+        let cache = Arc::new(Mutex::new(HashMap::default()));
+        let local_plan = sample_plan();
+        let remote_plan = ZedOpenPlan {
+            project: vitermux::ZedProjectTarget {
+                mode: "remote".into(),
+                remote_path: "/home/albertus/dev/agent-hud".into(),
+                ..Default::default()
+            },
+            attach: vitermux::ZedAttachSpec {
+                dedupe_key:
+                    "node:poros/acct:albertus@poros/srv:default/sess:default:main/win:index:2"
+                        .into(),
+                ..Default::default()
+            },
+            ..sample_plan()
+        };
+        let row = WorkbenchRow {
+            row_key: SharedString::from("node:poros/acct:albertus@poros/sess:main/win:index:2"),
+            dedupe_key: SharedString::from("node:poros/acct:albertus@poros/sess:main/win:index:2"),
+            ..sample_row()
+        };
+
+        store_cached_open_plan(&cache, "local-session", &local_plan);
+        store_cached_open_plan(&cache, "remote-session", &remote_plan);
+
+        assert!(cached_open_plan_for_session(&cache, "local-session", &sample_row()).is_some());
+        assert!(
+            cached_open_plan_for_session(&cache, "remote-session", &row).is_none(),
+            "remote plans should be refetched instead of reusing a potentially stale attach plan"
+        );
     }
 
     #[gpui::test]
